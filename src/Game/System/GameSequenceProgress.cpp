@@ -24,6 +24,7 @@
 #include "Game/Util/SoundUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
+#include "revolution/os.h"
 
 namespace {
     static const s32 sTimingPlayingTicoSE = 180;
@@ -154,6 +155,11 @@ void GameSequenceProgress::requestGalaxyMove(const GalaxyMoveArgument& rMoveArg)
     GameSequenceFunction::storeSceneStartGameDataHolder();
 
     if (rMoveArg.mMoveType == 4) {
+        const char* starName = GameSequenceFunction::getClearedStageName();
+        s32 powerStarId = GameSequenceFunction::getClearedPowerStarId();
+
+        OSReport("[ARCHIPELAGO] Star collected: %s, ID: %d\n", starName, powerStarId);
+
         GameSequenceFunction::updateGameDataAndSequenceAfterStageResultSequence();
         mFindingLuigiEventScheduler->updateOnStageResult(GameSequenceFunction::getClearedStageName(), GameSequenceFunction::getClearedPowerStarId());
 
