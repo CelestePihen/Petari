@@ -117,6 +117,11 @@ parser.add_argument(
     help="builds equivalent (but non-matching) or modded objects",
 )
 parser.add_argument(
+    "--product-sel",
+    type=Path,
+    help="retail product.sel to refresh for this ELF (output: build/VERSION/files/ModuleData/product.sel)",
+)
+parser.add_argument(
     "--no-progress",
     dest="progress",
     action="store_false",
@@ -155,6 +160,21 @@ config.wibo_tag = "1.0.3"
 # Project
 config.config_path = Path("config") / config.version / "config.yml"
 config.check_sha_path = Path("config") / config.version / "build.sha1"
+
+if args.product_sel:
+    if not args.product_sel.is_file():
+        parser.error("--product-sel must point to an existing retail product.sel")
+    config.custom_build_rules = [{
+        "name": "product_sel",
+        "command": "$python tools/update_product_sel.py $in $out",
+        "description": "SEL $out",
+    }]
+    config.custom_build_steps = {"post-link": [{
+        "outputs": config.out_path() / "files/ModuleData/product.sel",
+        "rule": "product_sel",
+        "inputs": [args.product_sel, config.out_path() / "main.elf"],
+        "implicit": ["tools/update_product_sel.py"],
+    }]}
 config.asflags = [
     "-mgekko",
     "--strip-local-absolute",
