@@ -44,5 +44,7 @@ compile_commands.json
 /*.txt
 *.exe
 
+.venv
+
 vendor/Kamek/Source/obj/
 vendor/Kamek/Source/bin/
