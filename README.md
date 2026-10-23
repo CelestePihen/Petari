@@ -25,6 +25,16 @@ Petari
 
 A work-in-progress decompilation of Super Mario Galaxy.
 
+This Archipelago fork builds an independent Kamek module for PAL (`RMGP01`) and USA (`RMGE01`):
+
+```sh
+./build.sh RMGP01
+./build.sh RMGE01
+./build.sh RMGP01 --diagnostic
+```
+
+The diagnostic target builds Petari without linking Archipelago into the main DOL. See the [Archipelago Kamek guide](docs/archipelago-kamek.md) for prerequisites, preparing a private game copy, launching in Dolphin and reading the mailbox. The targets do not overwrite existing game installations.
+
 This repository does **not** contain any game assets or assembly whatsoever. An existing copy of the game is required.
 
 This project is **not** meant to be an effort to create a PC port. Join the Discord server to learn more and ask about our work-in-progress PC port "AstroCore".
