@@ -43,3 +43,6 @@ compile_commands.json
 # Miscellaneous
 /*.txt
 *.exe
+
+vendor/Kamek/Source/obj/
+vendor/Kamek/Source/bin/
