@@ -4,14 +4,11 @@
       "name": "IntelliSense",
       "includePath": [
         "${workspaceRoot}\\include\\**",
-        "${workspaceRoot}\\libs\\**"
+        "${workspaceRoot}\\libs\\**",
+        "${workspaceRoot}\\vendor\\**",
+        "${workspaceRoot}\\build\\kamek\\RMGP01"
       ],
-      "defines": [
-        "GEKKO",
-        "REVOLUTION",
-        "__MWERKS__",
-        "INTELLISENSE_FIX"
-      ],
+      "defines": ["GEKKO", "REVOLUTION", "__MWERKS__", "INTELLISENSE_FIX"],
       "compilerSwitches": "-pno-ms-extensions, -std=c++98, -fpack-struct=4",
       "intelliSenseMode": "windows-clang-x86"
     }
