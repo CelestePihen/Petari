@@ -24,7 +24,7 @@ struct Discovery {
     u32 status, module, moduleSize, mailbox, mailboxSize, error;
 };
 extern "C" volatile Discovery gArchipelagoDiscovery = {0x4150424F, 0x4F543031, 1, sizeof(Discovery), AP_REGION, 0x30310000, 0,
-                                                       0,          0,          0, 12,   0};
+                                                       0,          0,          0, AP_MAILBOX_SIZE,   0};
 
 static u32 aligned(u32 value) {
     return (value + 31) & ~31u;
@@ -109,10 +109,13 @@ extern "C" void apLoadAndCreateRootHeap() {
             fail(13);
     }
 
+    if (AP_MAILBOX_OFFSET > AP_MODULE_SIZE || AP_MAILBOX_SIZE > AP_MODULE_SIZE - AP_MAILBOX_OFFSET)
+        fail(10);
+
     volatile u32* mailbox = (volatile u32*)(base + AP_MAILBOX_OFFSET);
 
     // mailbox[1] = mailbox version
-    if (mailbox[0] != 0x4150534D || mailbox[1] != 1 || *(volatile u32*)(base + AP_READY_OFFSET) != 0x41505244)
+    if (mailbox[0] != 0x4150534D || mailbox[1] != 2 || *(volatile u32*)(base + AP_READY_OFFSET) != 0x41505244)
         fail(10);
     // No heap exists yet; return only the last, temporary arena allocation.
     if ((u32)OSGetMEM1ArenaLo() != (u32)binary + readSize)

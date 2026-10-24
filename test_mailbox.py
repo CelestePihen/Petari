@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Discover AP mailbox v1 in MEM1 and verify a Dolphin Memory Engine round trip."""
+"""Discover AP mailbox v2 in MEM1 and verify a Dolphin Memory Engine round trip."""
+
 import argparse
 import configparser
 import json
@@ -10,13 +11,48 @@ import stat
 import shutil
 import sys
 import subprocess
+import tempfile
 import time
+from archipelago_protocol import (
+    DISCOVERY_VERSION,
+    DISCOVERY_SIZE,
+    MAILBOX_MAGIC,
+    MAILBOX_VERSION,
+    MAILBOX_SIZE,
+    EVENT_CAPACITY,
+    EVENT_SIZE,
+    GALAXY_NAME_SIZE,
+)
 
 MEM1_START, MEM1_END = 0x80000000, 0x81800000
-SIGNATURE = b'APBOOT01'
+SIGNATURE = b"APBOOT01"
+
+QUEUE_OFFSET = 12
+WRITE_COUNT_OFFSET = QUEUE_OFFSET
+READ_COUNT_OFFSET = QUEUE_OFFSET + 4
+EVENTS_OFFSET = QUEUE_OFFSET + 8
 
 
-def discover(data, region):
+def discover(data: bytes, region: str) -> dict | None:
+    """
+    Recherche et valide le descripteur de découverte Archipelago dans la mémoire MEM1.
+
+    Parcourt les données mémoire à la recherche de la signature APBOOT01,
+    puis vérifie la région du jeu, la version du protocole, l'état du
+    bootstrap et les adresses mémoire du module et de la mailbox.
+
+    Args:
+        data (bytes): Contenu de la mémoire MEM1 de Dolphin.
+        region (str): Identifiant de la région attendue (RMGP01 ou RMGE01).
+
+    Returns:
+        dict | None: Informations sur la mailbox si elle est trouvée,
+        sinon None.
+
+    Raises:
+        RuntimeError: Si le bootstrap signale une erreur ou si plusieurs
+        descripteurs valides sont trouvés.
+    """
     found = []
     offset = 0
     while True:
@@ -24,108 +60,65 @@ def discover(data, region):
         if offset < 0:
             break
         if offset % 4 == 0 and offset + 48 <= len(data):
-            words = struct.unpack_from('>12I', data, offset)
-            _, _, version, size, r0, r1, status, module, length, mailbox, mailbox_size, error = words
-            actual_region = (r0.to_bytes(4, 'big') + r1.to_bytes(4, 'big')[:2]).decode('ascii', errors='replace')
-            if version == 1 and size == 48 and actual_region == region and r1 == 0x30310000:
+            words = struct.unpack_from(">12I", data, offset)
+            (
+                _,
+                _,
+                version,
+                size,
+                r0,
+                r1,
+                status,
+                module,
+                length,
+                mailbox,
+                mailbox_size,
+                error,
+            ) = words
+            actual_region = (r0.to_bytes(4, "big") + r1.to_bytes(4, "big")[:2]).decode(
+                "ascii", errors="replace"
+            )
+            if (
+                version == DISCOVERY_VERSION
+                and size == DISCOVERY_SIZE
+                and actual_region == region
+                and r1 == 0x30310000
+            ):
                 if status == 4:
-                    raise RuntimeError(f'Bootstrap error {error} at 0x{MEM1_START + offset:08X}')
-                if (status == 3 and module % 32 == 0 and MEM1_START <= module < MEM1_END and
-                        0 < length <= MEM1_END - module and mailbox_size == 12 and
-                        module <= mailbox <= module + length - 12):
+                    raise RuntimeError(
+                        f"Bootstrap error {error} at 0x{MEM1_START + offset:08X}"
+                    )
+                if (
+                    status == 3
+                    and module % 32 == 0
+                    and MEM1_START <= module < MEM1_END
+                    and 0 < length <= MEM1_END - module
+                    and mailbox_size == MAILBOX_SIZE
+                    and module <= mailbox <= module + length - mailbox_size
+                ):
                     mailbox_offset = mailbox - MEM1_START
-                    if mailbox_offset + 12 > len(data):
+                    if mailbox_offset + MAILBOX_SIZE > len(data):
                         offset += len(SIGNATURE)
                         continue
-                    magic, protocol, value = struct.unpack_from('>3I', data, mailbox_offset)
-                    if (magic, protocol) == (0x4150534D, 1):
-                        found.append(dict(discovery=MEM1_START + offset, address=mailbox,
-                                          region=region, version=protocol, testValue=value,
-                                          module=module, moduleSize=length))
+                    magic, protocol, value = struct.unpack_from(
+                        ">3I", data, mailbox_offset
+                    )
+                    if (magic, protocol) == (MAILBOX_MAGIC, MAILBOX_VERSION):
+                        found.append(
+                            dict(
+                                discovery=MEM1_START + offset,
+                                address=mailbox,
+                                region=region,
+                                version=protocol,
+                                testValue=value,
+                                module=module,
+                                moduleSize=length,
+                            )
+                        )
         offset += len(SIGNATURE)
     if len(found) > 1:
-        raise RuntimeError('Multiple valid AP descriptors; refusing an ambiguous write')
+        raise RuntimeError("Multiple valid AP descriptors; refusing an ambiguous write")
     return found[0] if found else None
-
-
-
-class SharedMemoryReader:
-    """Read only Dolphin's own MEM1 backing file, never process memory via ptrace."""
-
-    def __init__(self, pid):
-        self.pid = pid
-        self.fd = None
-
-    def hook(self):
-        proc = Path('/proc') / str(self.pid)
-        if (proc / 'exe').resolve(strict=True).name != 'dolphin-emu':
-            raise RuntimeError(f'PID {self.pid} is not dolphin-emu')
-        expected = f'/dev/shm/dolphin-emu.{self.pid}'
-        candidates = []
-        for entry in (proc / 'fd').iterdir():
-            try:
-                target = os.readlink(entry)
-            except FileNotFoundError:
-                continue
-            if target in (expected, expected + ' (deleted)'):
-                candidates.append(entry)
-        if not candidates:
-            raise RuntimeError(f'No Dolphin shared memory for PID {self.pid}; start emulation first')
-        opened = None
-        try:
-            identities = set()
-            for entry in candidates:
-                fd = os.open(entry, os.O_RDONLY | os.O_CLOEXEC)
-                info = os.fstat(fd)
-                if opened is None:
-                    opened = fd
-                else:
-                    os.close(fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
-                        info.st_size < MEM1_END - MEM1_START):
-                    raise RuntimeError('Invalid Dolphin shared-memory owner, size or type')
-                identities.add((info.st_dev, info.st_ino))
-            if len(identities) != 1:
-                raise RuntimeError('Ambiguous Dolphin shared-memory files')
-            device, inode = identities.pop()
-            device_text = f'{os.major(device):02x}:{os.minor(device):02x}'
-            valid_mapping = False
-            for line in (proc / 'maps').read_text().splitlines():
-                fields = line.split(maxsplit=5)
-                if len(fields) < 5:
-                    continue
-                start, end = (int(value, 16) for value in fields[0].split('-'))
-                if (fields[1] == 'rw-s' and int(fields[2], 16) == 0 and
-                        fields[3] == device_text and int(fields[4]) == inode and
-                        end - start >= MEM1_END - MEM1_START):
-                    valid_mapping = True
-            if not valid_mapping:
-                raise RuntimeError('No matching MEM1 mapping in this Dolphin process')
-            self.fd = opened
-            opened = None
-        finally:
-            if opened is not None:
-                os.close(opened)
-
-    def is_hooked(self):
-        return self.fd is not None
-
-    def get_status(self):
-        return f'read-only shared memory, PID {self.pid}'
-
-    def un_hook(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-
-    def read_bytes(self, address, size):
-        if (self.fd is None or size < 0 or not MEM1_START <= address <= MEM1_END or
-                size > MEM1_END - address):
-            raise RuntimeError('Shared-memory read outside MEM1 or reader closed')
-        data = os.pread(self.fd, size, address - MEM1_START)
-        if len(data) != size:
-            raise RuntimeError('Short Dolphin shared-memory read')
-        return data
 
 
 def verify_call_hooks(read_bytes, discovery: dict, manifest: dict) -> list[dict]:
@@ -190,125 +183,610 @@ def verify_call_hooks(read_bytes, discovery: dict, manifest: dict) -> list[dict]
     return verified
 
 
+class SharedMemoryReader:
+    """
+    Permet de lire la mémoire MEM1 d'une instance Dolphin déjà lancée.
+
+    Accède au fichier de mémoire partagée Linux utilisé par Dolphin,
+    sans utiliser ptrace ni modifier les protections du noyau.
+
+    Cette classe fournit uniquement un accès en lecture.
+    """
+
+    def __init__(self, pid: int):
+        """
+        Initialise le lecteur de mémoire partagée.
+
+        Args:
+            pid (int): Identifiant du processus Dolphin à utiliser.
+        """
+        self.pid = pid
+        self.fd = None
+
+    def hook(self):
+        """
+        Ouvre et valide le fichier de mémoire partagée de Dolphin.
+
+        Vérifie notamment l'identité du processus, les permissions,
+        le fichier de mémoire partagée et sa correspondance avec
+        le mapping MEM1 du processus.
+
+        Raises:
+            RuntimeError: Si le processus ou sa mémoire partagée
+            ne correspondent pas aux conditions attendues.
+            OSError: Si l'accès aux fichiers du processus échoue.
+        """
+        proc = Path("/proc") / str(self.pid)
+        if (proc / "exe").resolve(strict=True).name != "dolphin-emu":
+            raise RuntimeError(f"PID {self.pid} is not dolphin-emu")
+        expected = f"/dev/shm/dolphin-emu.{self.pid}"
+        candidates = []
+        for entry in (proc / "fd").iterdir():
+            try:
+                target = os.readlink(entry)
+            except FileNotFoundError:
+                continue
+            if target in (expected, expected + " (deleted)"):
+                candidates.append(entry)
+        if not candidates:
+            raise RuntimeError(
+                f"No Dolphin shared memory for PID {self.pid}; start emulation first"
+            )
+        opened = None
+        try:
+            identities = set()
+            for entry in candidates:
+                fd = os.open(entry, os.O_RDONLY | os.O_CLOEXEC)
+                info = os.fstat(fd)
+                if opened is None:
+                    opened = fd
+                else:
+                    os.close(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_size < MEM1_END - MEM1_START
+                ):
+                    raise RuntimeError(
+                        "Invalid Dolphin shared-memory owner, size or type"
+                    )
+                identities.add((info.st_dev, info.st_ino))
+            if len(identities) != 1:
+                raise RuntimeError("Ambiguous Dolphin shared-memory files")
+            device, inode = identities.pop()
+            device_text = f"{os.major(device):02x}:{os.minor(device):02x}"
+            valid_mapping = False
+            for line in (proc / "maps").read_text().splitlines():
+                fields = line.split(maxsplit=5)
+                if len(fields) < 5:
+                    continue
+                start, end = (int(value, 16) for value in fields[0].split("-"))
+                if (
+                    fields[1] == "rw-s"
+                    and int(fields[2], 16) == 0
+                    and fields[3] == device_text
+                    and int(fields[4]) == inode
+                    and end - start >= MEM1_END - MEM1_START
+                ):
+                    valid_mapping = True
+            if not valid_mapping:
+                raise RuntimeError("No matching MEM1 mapping in this Dolphin process")
+            self.fd = opened
+            opened = None
+        finally:
+            if opened is not None:
+                os.close(opened)
+
+    def is_hooked(self) -> bool:
+        """
+        Indique si le lecteur possède un accès ouvert à la mémoire partagée.
+
+        Returns:
+            bool: True si la mémoire est accessible, False sinon.
+        """
+        return self.fd is not None
+
+    def get_status(self) -> str:
+        """
+        Retourne une description de l'état du lecteur.
+
+        Returns:
+            str: Description du backend de lecture et PID de Dolphin.
+        """
+        return f"read-only shared memory, PID {self.pid}"
+
+    def un_hook(self):
+        """
+        Ferme le descripteur du fichier de mémoire partagée.
+
+        Libère les ressources utilisées par le lecteur.
+        """
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read_bytes(self, address: int, size: int) -> bytes:
+        """
+        Lit une quantité précise d'octets dans la mémoire MEM1 de Dolphin.
+
+        Convertit l'adresse mémoire Wii en position dans le fichier
+        de mémoire partagée, puis récupère les octets demandés.
+
+        Args:
+            address (int): Adresse mémoire Wii à lire.
+            size (int): Nombre d'octets à récupérer.
+
+        Returns:
+            bytes: Octets lus dans la mémoire du jeu.
+
+        Raises:
+            RuntimeError: Si le lecteur est fermé, si l'adresse dépasse
+            MEM1 ou si la lecture est incomplète.
+            OSError: Si la lecture du fichier échoue.
+        """
+        if (
+            self.fd is None
+            or size < 0
+            or not MEM1_START <= address <= MEM1_END
+            or size > MEM1_END - address
+        ):
+            raise RuntimeError("Shared-memory read outside MEM1 or reader closed")
+        data = os.pread(self.fd, size, address - MEM1_START)
+        if len(data) != size:
+            raise RuntimeError("Short Dolphin shared-memory read")
+        return data
+
+
+def read_star_events(read_bytes, mailbox_address: int) -> dict:
+    """
+    Lit les événements StarCollected en attente dans la mailbox.
+
+    Récupère writeCount et readCount, calcule le nombre d'événements
+    non consommés, puis parcourt la file circulaire dans l'ordre FIFO.
+
+    Chaque événement contient le nom interne de la galaxie,
+    l'identifiant de l'étoile et un numéro de séquence.
+
+    La fonction vérifie également l'état des compteurs afin de
+    détecter certaines modifications concurrentes pendant la lecture.
+
+    Cette fonction ne consomme pas les événements et ne modifie
+    pas readCount.
+
+    Args:
+        read_bytes (callable): Fonction permettant de lire la mémoire Dolphin.
+        mailbox_address (int): Adresse mémoire de la mailbox Archipelago.
+
+    Returns:
+        dict: État de la file contenant writeCount, readCount,
+        le nombre d'événements en attente et leur liste.
+
+    Raises:
+        RuntimeError: Si les compteurs indiquent un état invalide
+        ou changent pendant la vérification.
+        UnicodeDecodeError: Si un nom de galaxie contient des octets
+        incompatibles avec l'encodage ASCII.
+    """
+    header = bytes(read_bytes(mailbox_address + WRITE_COUNT_OFFSET, 8))
+    write_count, read_count = struct.unpack(">2I", header)
+
+    pending = (write_count - read_count) & 0xFFFFFFFF
+
+    if pending > EVENT_CAPACITY:
+        raise RuntimeError(f"Invalid event queue state: {pending} pending")
+
+    events = []
+
+    for sequence in range(read_count, read_count + pending):
+        index = sequence % EVENT_CAPACITY
+        address = mailbox_address + EVENTS_OFFSET + index * EVENT_SIZE
+
+        raw = bytes(read_bytes(address, EVENT_SIZE))
+        name = raw[:GALAXY_NAME_SIZE].split(b"\0", 1)[0].decode("ascii")
+        star_id = struct.unpack_from(">I", raw, GALAXY_NAME_SIZE)[0]
+
+        events.append(
+            {"sequence": sequence & 0xFFFFFFFF, "galaxyName": name, "starId": star_id}
+        )
+
+        # vérifier que les compteurs n'ont pas changé pendant la lecture
+        current = bytes(read_bytes(mailbox_address + WRITE_COUNT_OFFSET, 8))
+
+        if current != header:
+            raise RuntimeError("Event queue changed during read")
+
+    return {
+        "writeCount": write_count,
+        "readCount": read_count,
+        "pending": pending,
+        "events": events,
+    }
+
+
+def ack_star_events(dme, mailbox_address: int, queue: dict) -> int:
+    """
+    Acquitte les événements lus en avançant readCount.
+
+    Args:
+        dme: Interface mémoire Dolphin disposant de read_word et write_word.
+        mailbox_address (int): Adresse de la mailbox.
+        queue (dict): Résultat de read_star_events().
+
+    Returns:
+        int: Nombre d'événements acquittés.
+
+    Raises:
+        RuntimeError: Si readCount a changé de manière inattendue
+        ou si une écriture échoue.
+    """
+    address = mailbox_address + READ_COUNT_OFFSET
+    expected = queue["readCount"]
+
+    for event in queue["events"]:
+        current = dme.read_word(address)
+
+        if current != expected:
+            raise RuntimeError(
+                f"readCount changed unexpectedly: {current} != {expected}"
+            )
+
+        expected = (expected + 1) & 0xFFFFFFFF
+
+        dme.write_word(address, expected)
+
+        if dme.read_word(address) != expected:
+            raise RuntimeError("Failed to acknowledge star event")
+
+    return len(queue["events"])
+
+
+def watch_star_events(dme, mailbox_address: int, acknowledge: bool = False):
+    """
+    Surveille les événements StarCollected pendant l'exécution du jeu.
+
+    Lit régulièrement la file d'événements, affiche les nouvelles étoiles
+    et les acquitte si le mode écriture est activé.
+
+    Args:
+        dme: Interface de communication avec Dolphin.
+        mailbox_address (int): Adresse de la mailbox Archipelago.
+        acknowledge (bool): Indique si les événements doivent être acquittés.
+    """
+    print("Watching star events... Press Ctrl+C to stop.")
+
+    last_write_count = None
+    last_read_count = None
+
+    try:
+        while True:
+            try:
+                queue = read_star_events(dme.read_bytes, mailbox_address)
+            except RuntimeError as exc:
+                print(f"Dolphin memory unavailable: {exc}")
+                print("Stopping mailbox monitoring.")
+                break
+
+            if (
+                queue["writeCount"] != last_write_count
+                or queue["readCount"] != last_read_count
+            ):
+                print(json.dumps(queue, indent=2), flush=True)
+
+                last_write_count = queue["writeCount"]
+                last_read_count = queue["readCount"]
+
+            if acknowledge and queue["pending"] > 0:
+                count = ack_star_events(dme, mailbox_address, queue)
+
+                print(f"Acknowledged {count} star event(s)", flush=True)
+
+                last_read_count = (queue["readCount"] + count) & 0xFFFFFFFF
+
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("\nStopped watching star events.")
+
+
 def main():
+    """
+    Point d'entrée principal du client de test Archipelago.
+
+    Analyse les arguments de la ligne de commande, puis se connecte
+    à Dolphin ou lance une nouvelle instance selon les options choisies.
+
+    Recherche et valide la mailbox, vérifie éventuellement les hooks,
+    teste la lecture/écriture de testValue, puis récupère les
+    événements StarCollected présents dans la file.
+
+    Affiche les résultats au format JSON et peut les enregistrer
+    dans un fichier.
+
+    Ferme les ressources ouvertes et arrête uniquement l'instance
+    Dolphin lancée par le script, sauf si --keep-running est utilisé.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--region', choices=['RMGP01', 'RMGE01'])
-    parser.add_argument('--value', type=lambda x: int(x, 0), default=0x12345678)
-    parser.add_argument('--timeout', type=float, default=60)
-    parser.add_argument('--observe-seconds', type=float, default=5, help='Check mailbox stability while the game continues booting')
-    parser.add_argument('--read-only', action='store_true')
-    parser.add_argument('--shared-memory-pid', type=int, help='Linux read-only access to an already running Dolphin PID')
-    parser.add_argument('--launch', type=Path, help='Launch a private test game as this Python process child')
-    parser.add_argument('--dolphin-user', type=Path)
-    parser.add_argument('--null-video', action='store_true', help='Use Dolphin Null video backend; no gameplay rendering test')
-    parser.add_argument('--keep-running', action='store_true')
-    parser.add_argument('--output', type=Path)
-    parser.add_argument('--manifest', type=Path, help='Verify installed call hooks against a build manifest')
+
+    parser.add_argument("--region", choices=["RMGP01", "RMGE01"])
+
+    parser.add_argument("--value", type=lambda x: int(x, 0), default=0x12345678)
+
+    parser.add_argument("--timeout", type=float, default=60)
+
+    parser.add_argument(
+        "--observe-seconds",
+        type=float,
+        default=5,
+        help="Check mailbox stability while the game continues booting",
+    )
+
+    parser.add_argument("--read-only", action="store_true")
+
+    parser.add_argument(
+        "--shared-memory-pid",
+        type=int,
+        help="Linux read-only access to an already running Dolphin PID",
+    )
+
+    parser.add_argument(
+        "--launch",
+        type=Path,
+        help="Launch a private test game as this Python process child",
+    )
+
+    parser.add_argument("--dolphin-user", type=Path)
+
+    parser.add_argument(
+        "--null-video",
+        action="store_true",
+        help="Use Dolphin Null video backend; no gameplay rendering test",
+    )
+
+    parser.add_argument("--keep-running", action="store_true")
+
+    parser.add_argument("--output", type=Path)
+
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Verify installed call hooks against a build manifest",
+    )
+
+    parser.add_argument(
+        "--ack-events",
+        action="store_true",
+        help="Acknowledge pending star events after reading them",
+    )
+
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuously monitor star events until Ctrl+C",
+    )
+
     args = parser.parse_args()
+    if args.ack_events and args.read_only:
+        parser.error("--ack-events cannot be used with --read-only")
+
     if args.observe_seconds < 0 or args.timeout <= 0:
-        parser.error('Timeout must be positive and observation duration nonnegative')
+        parser.error("Timeout must be positive and observation duration nonnegative")
+
     if not 0 <= args.value <= 0xFFFFFFFF:
-        parser.error('--value must be a u32')
-    if args.launch and not args.dolphin_user:
-        parser.error('--launch requires a dedicated --dolphin-user directory')
+        parser.error("--value must be a u32")
+
     if args.shared_memory_pid is not None:
-        if (not sys.platform.startswith('linux') or args.shared_memory_pid <= 0 or
-                not args.read_only or args.launch):
-            parser.error('--shared-memory-pid requires Linux, a positive PID, --read-only and no --launch')
+        if (
+            not sys.platform.startswith("linux")
+            or args.shared_memory_pid <= 0
+            or not args.read_only
+            or args.launch
+        ):
+            parser.error(
+                "--shared-memory-pid requires Linux, a positive PID, --read-only and no --launch"
+            )
         dme = SharedMemoryReader(args.shared_memory_pid)
     else:
         import dolphin_memory_engine as dme
+
     child = None
     log = None
+    temp_dir = None
+    executable_path: Path | None = None
+
     try:
         if args.launch:
-            args.dolphin_user.mkdir(parents=True, exist_ok=True)
-            config_dir = args.dolphin_user / 'Config'
-            config_dir.mkdir(exist_ok=True)
-            config = configparser.ConfigParser(); config.optionxform = str
-            config.read(config_dir / 'Dolphin.ini')
-            for section, values in {'Analytics': {'Enabled': 'False', 'PermissionAsked': 'True'}, 'Interface': {'ConfirmStop': 'False', 'UsePanicHandlers': 'False'}}.items():
-                if not config.has_section(section): config.add_section(section)
-                for key, value in values.items(): config.set(section, key, value)
-            with (config_dir / 'Dolphin.ini').open('w') as stream: config.write(stream)
-            (config_dir / 'Logger.ini').write_text('[Options]\nWriteToConsole = True\nWriteToFile = True\nVerbosity = 4\n[Logs]\nBOOT = True\nOSREPORT = True\nHLE = True\n')
-            log = (args.dolphin_user / 'launch.log').open('w')
-            executable = 'dolphin-emu'
-            if sys.platform.startswith('linux'):
+            if args.dolphin_user:
+                args.dolphin_user.mkdir(parents=True, exist_ok=True)
+
+                config_dir = args.dolphin_user / "Config"
+                config_dir.mkdir(exist_ok=True)
+
+                config = configparser.ConfigParser()
+                config.optionxform = str
+                config.read(config_dir / "Dolphin.ini")
+
+                for section, values in {
+                    "Analytics": {"Enabled": "False", "PermissionAsked": "True"},
+                    "Interface": {"ConfirmStop": "False", "UsePanicHandlers": "False"},
+                }.items():
+                    if not config.has_section(section):
+                        config.add_section(section)
+
+                    for key, value in values.items():
+                        config.set(section, key, value)
+
+                with (config_dir / "Dolphin.ini").open("w") as stream:
+                    config.write(stream)
+                (config_dir / "Logger.ini").write_text(
+                    "[Options]\nWriteToConsole = True\nWriteToFile = True\nVerbosity = 4\n[Logs]\nBOOT = True\nOSREPORT = True\nHLE = True\n"
+                )
+
+            log_path = (
+                args.dolphin_user / "launch.log"
+                if args.dolphin_user
+                else Path("dolphin-ap-launch.log")
+            )
+
+            log = log_path.open("w")
+            executable = "dolphin-emu"
+
+            if sys.platform.startswith("linux"):
                 # DME supports an exact process name; select our child, not another open Dolphin.
-                process_name = f'apd-{os.getpid()}'
-                executable_path = args.dolphin_user.resolve() / process_name
-                executable_path.symlink_to(shutil.which('dolphin-emu'))
+                process_name = f"apd-{os.getpid()}"
+                temp_dir = tempfile.TemporaryDirectory(prefix="ap-dolphin-")
+                executable_path = Path(temp_dir.name) / process_name
+
+                dolphin_path = shutil.which("dolphin-emu")
+
+                if dolphin_path is None:
+                    raise RuntimeError("Dolphin executable not found in PATH")
+
+                executable_path.symlink_to(dolphin_path)
+
                 executable = str(executable_path)
-                os.environ['DME_DOLPHIN_PROCESS_NAME'] = process_name
-            command = [executable, '-b', '-u', str(args.dolphin_user.resolve()), '-e', str(args.launch.resolve()),
-                       '-C', 'Dolphin.Core.EnableCheats=False', '-C', 'Dolphin.Core.PauseOnPanic=False',
-                       '-C', 'Dolphin.Core.EmulationSpeed=1.0', '-C', 'Dolphin.DSP.Backend=Null']
+                os.environ["DME_DOLPHIN_PROCESS_NAME"] = process_name
+
+            command = [
+                executable,
+                "-b",
+                "-e",
+                str(args.launch.resolve()),
+                "-C",
+                "Dolphin.Core.EnableCheats=False",
+                "-C",
+                "Dolphin.Core.PauseOnPanic=False",
+                "-C",
+                "Dolphin.Core.EmulationSpeed=1.0",
+                "-C",
+                "Dolphin.DSP.Backend=Null",
+            ]
+
+            if args.dolphin_user:
+                command += ["-u", str(args.dolphin_user.resolve())]
+
             env = dict(os.environ)
+
             if args.null_video:
-                if sys.platform.startswith('linux'):
-                    env['QT_QPA_PLATFORM'] = 'xcb'
-                command += ['-v', 'Null']
-            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
+                if sys.platform.startswith("linux"):
+                    env["QT_QPA_PLATFORM"] = "xcb"
+                command += ["-v", "Null"]
+
+            child = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, env=env
+            )
+
         deadline = time.monotonic() + args.timeout
         result = None
+
         while time.monotonic() < deadline:
             if child and child.poll() is not None:
-                raise RuntimeError(f'Dolphin exited ({child.returncode}); inspect {args.dolphin_user}/launch.log')
+                raise RuntimeError(
+                    f"Dolphin exited ({child.returncode}); inspect {log_path}"
+                )
+
             if not dme.is_hooked():
                 dme.hook()
+
             if dme.is_hooked():
                 try:
-                    region = bytes(dme.read_bytes(MEM1_START, 6)).decode('ascii', errors='replace')
+                    region = bytes(dme.read_bytes(MEM1_START, 6)).decode(
+                        "ascii", errors="replace"
+                    )
                 except RuntimeError as exc:
                     raise RuntimeError(
-                        'Dolphin detected but MEM1 is unreadable. On Linux, Yama may deny '
-                        'an independently launched client. For this running game, use '
-                        '--read-only --shared-memory-pid <DOLPHIN_PID>; for DME writes, '
-                        'launch Dolphin with --launch. No system permission changes are required.'
+                        "Dolphin detected but MEM1 is unreadable. On Linux, Yama may deny "
+                        "an independently launched client. For this running game, use "
+                        "--read-only --shared-memory-pid <DOLPHIN_PID>; for DME writes, "
+                        "launch Dolphin with --launch. No system permission changes are required."
                     ) from exc
-                if region in ('RMGP01', 'RMGE01') and (args.region is None or region == args.region):
-                    result = discover(bytes(dme.read_bytes(MEM1_START, MEM1_END - MEM1_START)), region)
+                if region in ("RMGP01", "RMGE01") and (
+                    args.region is None or region == args.region
+                ):
+                    result = discover(
+                        bytes(dme.read_bytes(MEM1_START, MEM1_END - MEM1_START)), region
+                    )
                     if result:
                         break
             time.sleep(0.25)
+
         if result is None:
-            raise RuntimeError(f'No ready AP mailbox; DME status={dme.get_status()}. Use --launch for parent/child Linux permissions; no kernel settings are changed.')
-        address = result['address']
+            raise RuntimeError(
+                f"No ready AP mailbox; DME status={dme.get_status()}. Use --launch for parent/child Linux permissions; no kernel settings are changed."
+            )
+        address = result["address"]
+
         # Check the descriptor again immediately before the write.
-        current = bytes(dme.read_bytes(result['discovery'], 48))
-        expected_header = struct.pack('>6I', 0x4150424F, 0x4F543031, 1, 48,
-                                      int.from_bytes(result['region'][:4].encode(), 'big'), 0x30310000)
-        if current[:24] != expected_header or struct.unpack_from('>6I', current, 24) != (3, result['module'], result['moduleSize'], address, 12, 0):
-            raise RuntimeError('Descriptor changed during discovery')
-        if bytes(dme.read_bytes(address, 8)) != struct.pack('>2I', 0x4150534D, 1):
-            raise RuntimeError('Mailbox protocol changed before write')
+        current = bytes(dme.read_bytes(result["discovery"], DISCOVERY_SIZE))
+        expected_header = struct.pack(
+            ">6I",
+            0x4150424F,
+            0x4F543031,
+            DISCOVERY_VERSION,
+            DISCOVERY_SIZE,
+            int.from_bytes(result["region"][:4].encode(), "big"),
+            0x30310000,
+        )
+
+        if current[:24] != expected_header or struct.unpack_from(
+            ">6I", current, 24
+        ) != (3, result["module"], result["moduleSize"], address, MAILBOX_SIZE, 0):
+            raise RuntimeError("Descriptor changed during discovery")
+
+        if bytes(dme.read_bytes(address, 8)) != struct.pack(
+            ">2I", MAILBOX_MAGIC, MAILBOX_VERSION
+        ):
+            raise RuntimeError("Mailbox protocol changed before write")
+
         if args.manifest:
-            result['hooks'] = verify_call_hooks(dme.read_bytes, result, json.loads(args.manifest.read_text()))
+            result["hooks"] = verify_call_hooks(
+                dme.read_bytes, result, json.loads(args.manifest.read_text())
+            )
+
         if not args.read_only:
             dme.write_word(address + 8, args.value)
             value = dme.read_word(address + 8)
             if value != args.value:
-                raise RuntimeError(f'Mailbox readback failed: {value:08X}')
-            result['written'] = args.value
-            result['readback'] = value
-        expected_value = result.get('written', result['testValue'])
+                raise RuntimeError(f"Mailbox readback failed: {value:08X}")
+            result["written"] = args.value
+            result["readback"] = value
+
+        expected_value = result.get("written", result["testValue"])
         until = time.monotonic() + args.observe_seconds
+
         while time.monotonic() < until:
-            if bytes(dme.read_bytes(address, 12)) != struct.pack('>3I', 0x4150534D, 1, expected_value):
-                raise RuntimeError('Mailbox changed during the observation period')
+            if bytes(dme.read_bytes(address, 12)) != struct.pack(
+                ">3I", MAILBOX_MAGIC, MAILBOX_VERSION, expected_value
+            ):
+                raise RuntimeError("Mailbox changed during the observation period")
             time.sleep(0.1)
-        result['observed_seconds'] = args.observe_seconds
+
+        result["observed_seconds"] = args.observe_seconds
+
         if args.shared_memory_pid is not None:
-            result['backend'] = 'shared-memory-read-only'
-            result['dolphin_pid'] = args.shared_memory_pid
+            result["backend"] = "shared-memory-read-only"
+            result["dolphin_pid"] = args.shared_memory_pid
+
         if child:
-            result['dolphin_pid'] = child.pid
-            if sys.platform.startswith('linux'):
-                result['dolphin_process_name'] = process_name
+            result["dolphin_pid"] = child.pid
+            if sys.platform.startswith("linux"):
+                result["dolphin_process_name"] = process_name
+
+        result["starQueue"] = read_star_events(dme.read_bytes, address)
+
         print(json.dumps(result, indent=2))
+
         if args.output:
-            args.output.write_text(json.dumps(result, indent=2) + '\n')
+            args.output.write_text(json.dumps(result, indent=2) + "\n")
+
+        if args.watch:
+            watch_star_events(dme, address, acknowledge=args.ack_events)
+
+        if args.ack_events and not args.watch:
+            count = ack_star_events(dme, address, result["starQueue"])
+            print(f"Acknowledge {count} star event(s)")
+
+        if args.output:
+            args.output.write_text(json.dumps(result, indent=2) + "\n")
     finally:
         if dme.is_hooked():
             dme.un_hook()
@@ -317,15 +795,16 @@ def main():
             try:
                 child.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                child.kill(); child.wait()
+                child.kill()
+                child.wait()
         if log:
             log.close()
-        if args.launch and sys.platform.startswith('linux'):
-            (args.dolphin_user.resolve() / f'apd-{os.getpid()}').unlink(missing_ok=True)
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except (RuntimeError, OSError) as exc:
-        sys.exit(f'Error: {exc}')
+        sys.exit(f"Error: {exc}")

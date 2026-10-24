@@ -1,4 +1,6 @@
 #include "Game/Archipelago/ArchipelagoMailbox.hpp"
 
-__declspec(export) ArchipelagoMailbox gArchipelagoMailbox = {0x4150534D,  // APSM
-                                                             1, 0};
+__declspec(export) ArchipelagoMailbox gArchipelagoMailbox = {AP_MAILBOX_MAGIC,  // APSM
+                                                             AP_MAILBOX_VERSION,
+                                                             0,
+                                                             {0}};

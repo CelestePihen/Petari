@@ -13,6 +13,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from test_mailbox import read_star_events
+from archipelago_protocol import MAILBOX_SIZE, MAILBOX_VERSION
 from tools.build_archipelago import (
     REGIONS,
     align,
@@ -220,6 +222,13 @@ def exercise(region, conflict=False):
         len(logs) == 1 and logs[0]["stage"] == "TestGalaxy" and logs[0]["star_id"] == 42
     )
 
+    mailbox = module + manifest["mailbox_offset"]
+    assert word(descriptor + 40) == MAILBOX_SIZE
+    assert word(mailbox + 4) == MAILBOX_VERSION
+    queue = read_star_events(lambda address, size: bytes(machine.mem_read(address, size)), mailbox)
+    assert queue["writeCount"] == 1 and queue["readCount"] == 0
+    assert queue["events"] == [dict(sequence=0, galaxyName="TestGalaxy", starId=42)]
+
     # Retail sections may change only at bootstrap hooks and declared module call sites.
     retail = (ROOT / f"orig/{region}/sys/main.dol").read_bytes()
     replacements = {hook["address"]: hook["replacement"] for hook in manifest["hooks"]}
@@ -244,6 +253,7 @@ def exercise(region, conflict=False):
         hooks=len(hooks),
         log=logs[0],
         original_calls=1,
+        star_queue=queue,
         return_and_saved_registers="preserved",
         retail_sections="only declared hook words changed",
     )

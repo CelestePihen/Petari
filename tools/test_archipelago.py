@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Trust-boundary checks for module validation, DOL patching and mailbox discovery."""
 
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -16,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.build_archipelago import align, branch, dol_sections, fnv, validate_module
 from tools import build_archipelago as builder
+from archipelago_protocol import MAILBOX_SIZE, MAILBOX_VERSION
 
 spec = importlib.util.spec_from_file_location("ap_mailbox", ROOT / "test_mailbox.py")
 mailbox = importlib.util.module_from_spec(spec)
@@ -37,12 +40,12 @@ class ProtocolTests(unittest.TestCase):
             0x30310000,
             status,
             0x80001000,
-            0x100,
+            0x900,
             0x80001040,
-            12,
+            MAILBOX_SIZE,
             error,
         )
-        struct.pack_into(">3I", data, 0x1040, 0x4150534D, 1, 42)
+        struct.pack_into(">3I", data, 0x1040, 0x4150534D, MAILBOX_VERSION, 42)
         return data
 
     def test_discovery_both_regions(self):
@@ -74,7 +77,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_signature_and_version(self):
         data = self.descriptor()
-        struct.pack_into(">I", data, 0x1044, 2)
+        struct.pack_into(">I", data, 0x1044, MAILBOX_VERSION + 1)
         self.assertIsNone(mailbox.discover(data, "RMGP01"))
 
 
@@ -355,7 +358,7 @@ class HookInspectionTests(unittest.TestCase):
         self.manifest = dict(
             region="RMGP01",
             discovery=0x80000100,
-            module_size=0x100,
+            module_size=0x900,
             code_size=0x80,
             module_hooks=[dict(name="Example", address=0x80000400, target_offset=0x20)],
         )
@@ -394,6 +397,93 @@ class HookInspectionTests(unittest.TestCase):
                 RuntimeError, "bounds"
             ):
                 mailbox.verify_call_hooks(self.read, self.discovery, self.manifest)
+
+
+class StarQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.data = ProtocolTests().descriptor()
+        self.data[:6] = b"RMGP01"
+        self.address = 0x80001040
+        self.hooked = True
+
+    def read_bytes(self, address, size):
+        start = address - 0x80000000
+        return bytes(self.data[start:start + size])
+
+    def read_word(self, address):
+        return struct.unpack('>I', self.read_bytes(address, 4))[0]
+
+    def write_word(self, address, value):
+        struct.pack_into('>I', self.data, address - 0x80000000, value)
+
+    def is_hooked(self):
+        return self.hooked
+
+    def un_hook(self):
+        self.hooked = False
+
+    def queue(self, read_count, names):
+        write_count = (read_count + len(names)) & 0xffffffff
+        self.write_word(self.address + mailbox.WRITE_COUNT_OFFSET, write_count)
+        self.write_word(self.address + mailbox.READ_COUNT_OFFSET, read_count)
+        for index, name in enumerate(names):
+            slot = ((read_count + index) & 0xffffffff) % mailbox.EVENT_CAPACITY
+            offset = self.address + mailbox.EVENTS_OFFSET + slot * mailbox.EVENT_SIZE
+            raw = name.encode().ljust(mailbox.GALAXY_NAME_SIZE, b'\0') + struct.pack('>I', index + 1)
+            start = offset - 0x80000000
+            self.data[start:start + len(raw)] = raw
+
+    def test_read_fifo_without_consuming(self):
+        self.queue(31, ['FirstGalaxy', 'SecondGalaxy'])
+        queue = mailbox.read_star_events(self.read_bytes, self.address)
+        self.assertEqual([event['galaxyName'] for event in queue['events']], ['FirstGalaxy', 'SecondGalaxy'])
+        self.assertEqual([event['starId'] for event in queue['events']], [1, 2])
+        self.assertEqual(self.read_word(self.address + mailbox.READ_COUNT_OFFSET), 31)
+
+    def test_counter_wrap_and_acknowledgement(self):
+        self.queue(0xffffffff, ['FirstGalaxy', 'SecondGalaxy'])
+        queue = mailbox.read_star_events(self.read_bytes, self.address)
+        self.assertEqual([event['sequence'] for event in queue['events']], [0xffffffff, 0])
+        self.assertEqual(mailbox.ack_star_events(self, self.address, queue), 2)
+        self.assertEqual(self.read_word(self.address + mailbox.READ_COUNT_OFFSET), 1)
+        self.assertEqual(mailbox.read_star_events(self.read_bytes, self.address)['pending'], 0)
+
+    def test_full_and_invalid_queue(self):
+        self.queue(0, ['Galaxy'] * mailbox.EVENT_CAPACITY)
+        self.assertEqual(mailbox.read_star_events(self.read_bytes, self.address)['pending'], mailbox.EVENT_CAPACITY)
+        self.write_word(self.address + mailbox.WRITE_COUNT_OFFSET, mailbox.EVENT_CAPACITY + 1)
+        with self.assertRaisesRegex(RuntimeError, 'Invalid event queue'):
+            mailbox.read_star_events(self.read_bytes, self.address)
+
+    def test_stale_acknowledgement(self):
+        self.queue(0, ['Galaxy'])
+        queue = mailbox.read_star_events(self.read_bytes, self.address)
+        mailbox.ack_star_events(self, self.address, queue)
+        with self.assertRaisesRegex(RuntimeError, 'readCount changed'):
+            mailbox.ack_star_events(self, self.address, queue)
+
+    def test_concurrent_producer_detected(self):
+        self.queue(0, ['Galaxy'])
+        reads = []
+        def concurrent_read(address, size):
+            result = self.read_bytes(address, size)
+            if address == self.address + mailbox.EVENTS_OFFSET:
+                self.write_word(self.address + mailbox.WRITE_COUNT_OFFSET, 2)
+            reads.append(address)
+            return result
+        with self.assertRaisesRegex(RuntimeError, 'changed during read'):
+            mailbox.read_star_events(concurrent_read, self.address)
+
+    def test_watch_exit_does_not_acknowledge_old_snapshot(self):
+        self.queue(0, ['Galaxy'])
+        def watching(dme, address, acknowledge):
+            self.assertTrue(acknowledge)
+            mailbox.ack_star_events(dme, address, mailbox.read_star_events(dme.read_bytes, address))
+        argv = ['test_mailbox.py', '--region', 'RMGP01', '--observe-seconds', '0', '--watch', '--ack-events']
+        with patch.dict(sys.modules, {'dolphin_memory_engine': self}), patch.object(sys, 'argv', argv), \
+                patch.object(mailbox, 'watch_star_events', side_effect=watching), contextlib.redirect_stdout(io.StringIO()):
+            mailbox.main()
+        self.assertEqual(self.read_word(self.address + mailbox.READ_COUNT_OFFSET), 1)
 
 
 if __name__ == "__main__":

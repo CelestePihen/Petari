@@ -469,7 +469,7 @@ def build(region, game_dir=None, game_output=None):
     mailbox, mailbox_size = module_syms["gArchipelagoMailbox"]
     ready, ready_size = module_syms["gArchipelagoModuleReady"]
     if (
-        mailbox_size != 12
+        mailbox_size != 2196
         or ready_size != 4
         or mailbox + mailbox_size > code
         or ready + ready_size > code + bss
@@ -484,6 +484,7 @@ def build(region, game_dir=None, game_output=None):
         "AP_BSS_SIZE": bss,
         "AP_MODULE_SIZE": code + bss,
         "AP_MAILBOX_OFFSET": mailbox,
+        "AP_MAILBOX_SIZE": mailbox_size,
         "AP_READY_OFFSET": ready,
     }
     (out / "BootstrapConfig.hpp").write_text(
