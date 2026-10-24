@@ -128,6 +128,68 @@ class SharedMemoryReader:
         return data
 
 
+def verify_call_hooks(read_bytes, discovery: dict, manifest: dict) -> list[dict]:
+    """
+    Vérifie que les hooks Kamek sont correctement installés en mémoire.
+
+    Compare les instructions PowerPC présentes aux adresses des hooks
+    avec celles attendues à partir du manifeste de compilation.
+
+    Args:
+        read_bytes (callable): Fonction permettant de lire la mémoire Dolphin.
+        discovery (dict): Informations du module obtenues par discover().
+        manifest (dict): Manifeste contenant les hooks et leurs adresses.
+
+    Returns:
+        list[dict]: Liste des hooks vérifiés avec leurs adresses,
+        destinations et instructions.
+
+    Raises:
+        RuntimeError: Si le manifeste est invalide, si un hook dépasse
+        les limites autorisées ou si une instruction ne correspond pas.
+    """
+    if (
+        manifest.get("region") != discovery["region"]
+        or manifest.get("module_size") != discovery["moduleSize"]
+        or manifest.get("discovery") != discovery["discovery"]
+        or type(manifest.get("code_size")) is not int
+        or not 0 <= manifest["code_size"] <= discovery["moduleSize"]
+        or not isinstance(manifest.get("module_hooks"), list)
+    ):
+        raise RuntimeError("Hook manifest does not match the discovered module")
+    verified = []
+    seen = set()
+    for hook in manifest["module_hooks"]:
+        if not isinstance(hook, dict) or not isinstance(hook.get("name"), str):
+            raise RuntimeError("Invalid call hook in manifest")
+        address, offset = hook.get("address"), hook.get("target_offset")
+        if (
+            type(address) is not int
+            or type(offset) is not int
+            or address % 4
+            or not MEM1_START <= address <= MEM1_END - 4
+            or offset % 4
+            or not 0 <= offset <= manifest["code_size"] - 4
+            or address in seen
+        ):
+            raise RuntimeError("Invalid call hook bounds in manifest")
+        seen.add(address)
+        target = discovery["module"] + offset
+        delta = target - address
+        if not -0x02000000 <= delta < 0x02000000:
+            raise RuntimeError("Call hook is outside PowerPC branch range")
+        expected = 0x48000001 | (delta & 0x03FFFFFC)
+        actual = struct.unpack(">I", bytes(read_bytes(address, 4)))[0]
+        if actual != expected:
+            raise RuntimeError(
+                f'Hook {hook["name"]} is not installed at 0x{address:08X}'
+            )
+        verified.append(
+            dict(name=hook["name"], address=address, target=target, instruction=actual)
+        )
+    return verified
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--region', choices=['RMGP01', 'RMGE01'])
@@ -141,6 +203,7 @@ def main():
     parser.add_argument('--null-video', action='store_true', help='Use Dolphin Null video backend; no gameplay rendering test')
     parser.add_argument('--keep-running', action='store_true')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--manifest', type=Path, help='Verify installed call hooks against a build manifest')
     args = parser.parse_args()
     if args.observe_seconds < 0 or args.timeout <= 0:
         parser.error('Timeout must be positive and observation duration nonnegative')
@@ -220,6 +283,8 @@ def main():
             raise RuntimeError('Descriptor changed during discovery')
         if bytes(dme.read_bytes(address, 8)) != struct.pack('>2I', 0x4150534D, 1):
             raise RuntimeError('Mailbox protocol changed before write')
+        if args.manifest:
+            result['hooks'] = verify_call_hooks(dme.read_bytes, result, json.loads(args.manifest.read_text()))
         if not args.read_only:
             dme.write_word(address + 8, args.value)
             value = dme.read_word(address + 8)

@@ -23,7 +23,8 @@ struct Discovery {
     u32 magic0, magic1, version, size, region0, region1;
     u32 status, module, moduleSize, mailbox, mailboxSize, error;
 };
-extern "C" volatile Discovery gArchipelagoDiscovery = {0x4150424F, 0x4F543031, 1, sizeof(Discovery), AP_REGION, 0x30310000, 0, 0, 0, 0, 12, 0};
+extern "C" volatile Discovery gArchipelagoDiscovery = {0x4150424F, 0x4F543031, 1, sizeof(Discovery), AP_REGION, 0x30310000, 0,
+                                                       0,          0,          0, 12,   0};
 
 static u32 aligned(u32 value) {
     return (value + 31) & ~31u;
@@ -93,9 +94,24 @@ extern "C" void apLoadAndCreateRootHeap() {
     const u32* header = (const u32*)binary;
     if (header[0] != 0x4B616D65 || header[1] != 0x6B000002 || header[2] != AP_BSS_SIZE || header[3] != AP_CODE_SIZE)
         fail(9);
+
+    // Check every site before the loader installs any gameplay hook.
+    for (u32 i = 0; i < AP_CALL_HOOK_COUNT; ++i) {
+        if (*(volatile u32*)sAPCallHooks[i].address != sAPCallHooks[i].original)
+            fail(12);
+    }
     loadKamekBinary(&functions, binary, AP_FILE_SIZE);
     u32 base = gArchipelagoDiscovery.module;
+    for (u32 i = 0; i < AP_CALL_HOOK_COUNT; ++i) {
+        const APCallHook& hook = sAPCallHooks[i];
+        u32 expected = 0x48000001 | ((base + hook.targetOffset - hook.address) & 0x03FFFFFC);
+        if (*(volatile u32*)hook.address != expected)
+            fail(13);
+    }
+
     volatile u32* mailbox = (volatile u32*)(base + AP_MAILBOX_OFFSET);
+
+    // mailbox[1] = mailbox version
     if (mailbox[0] != 0x4150534D || mailbox[1] != 1 || *(volatile u32*)(base + AP_READY_OFFSET) != 0x41505244)
         fail(10);
     // No heap exists yet; return only the last, temporary arena allocation.
@@ -105,6 +121,7 @@ extern "C" void apLoadAndCreateRootHeap() {
     gArchipelagoDiscovery.mailbox = (u32)mailbox;
     asm { sync }
     gArchipelagoDiscovery.status = 3;
+    OSReport("[AP] Hooks installed: %u\n", AP_CALL_HOOK_COUNT);
     OSReport("[AP] Ready: module=%p size=%u mailbox=%p\n", (void*)base, AP_MODULE_SIZE, (void*)mailbox);
     createRootHeap__17HeapMemoryWatcherFv();
 }

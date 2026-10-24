@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "hooks": {
+    "StageResult": {
+      "owner": "requestGalaxyMove__20GameSequenceProgressFRC18GalaxyMoveArgument",
+      "callee": "updateGameDataAndSequenceAfterStageResultSequence__20GameSequenceFunctionFv"
+    }
+  }
+}

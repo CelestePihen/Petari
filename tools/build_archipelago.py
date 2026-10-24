@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build only AP C++ and a small SMG1 bootstrap; patch a private copy of retail."""
+
 import argparse
 import hashlib
 import json
@@ -11,8 +12,10 @@ import subprocess
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-REGIONS = {'RMGP01': '9bd1daa520bd1f573b6a4b82e03336e9c51b511f',
-           'RMGE01': '9a71008ae1ee9010e267fa67d1f0b0d4f0e895dd'}
+REGIONS = {
+    "RMGP01": "9bd1daa520bd1f573b6a4b82e03336e9c51b511f",
+    "RMGE01": "9a71008ae1ee9010e267fa67d1f0b0d4f0e895dd",
+}
 
 
 def align(n):
@@ -21,13 +24,22 @@ def align(n):
 
 def dol_sections(data):
     if len(data) < 0x100:
-        raise ValueError('Truncated DOL')
-    sections = list(zip(struct.unpack_from('>18I', data),
-                        struct.unpack_from('>18I', data, 0x48),
-                        struct.unpack_from('>18I', data, 0x90)))
+        raise ValueError("Truncated DOL")
+    sections = list(
+        zip(
+            struct.unpack_from(">18I", data),
+            struct.unpack_from(">18I", data, 0x48),
+            struct.unpack_from(">18I", data, 0x90),
+        )
+    )
     for off, addr, size in sections:
-        if size and (off < 0x100 or off + size > len(data) or addr < 0x80000000 or addr + size > 0x81800000):
-            raise ValueError('Invalid DOL section')
+        if size and (
+            off < 0x100
+            or off + size > len(data)
+            or addr < 0x80000000
+            or addr + size > 0x81800000
+        ):
+            raise ValueError("Invalid DOL section")
     return sections
 
 
@@ -35,13 +47,13 @@ def dol_offset(data, address, length=4):
     for off, addr, size in dol_sections(data):
         if addr <= address and address + length <= addr + size:
             return off + address - addr
-    raise ValueError(f'Unmapped DOL address: {address:08x}')
+    raise ValueError(f"Unmapped DOL address: {address:08x}")
 
 
 def symbols(region):
     result = {}
-    for line in (ROOT / f'config/{region}/symbols.txt').read_text().splitlines():
-        m = re.match(r'([^ ]+) = [^: ]+:0x([0-9a-fA-F]+);.*size:0x([0-9a-fA-F]+)', line)
+    for line in (ROOT / f"config/{region}/symbols.txt").read_text().splitlines():
+        m = re.match(r"([^ ]+) = [^: ]+:0x([0-9a-fA-F]+);.*size:0x([0-9a-fA-F]+)", line)
         if m:
             result[m[1]] = (int(m[2], 16), int(m[3], 16))
     return result
@@ -50,17 +62,19 @@ def symbols(region):
 def map_symbols(path):
     result = {}
     for line in path.read_text().splitlines():
-        m = re.match(r'\s*([0-9A-F]+) ([0-9A-F]+) (.+)$', line)
+        m = re.match(r"\s*([0-9A-F]+) ([0-9A-F]+) (.+)$", line)
         if m:
             result[m[3]] = (int(m[1], 16), int(m[2], 16))
     return result
 
 
 def call_site(data, syms, owner, target):
+    if owner not in syms or target not in syms:
+        raise ValueError(f"Unknown hook symbol: {owner} or {target}")
     start, size = syms[owner]
     found = []
     for pc in range(start, start + size, 4):
-        instruction = struct.unpack_from('>I', data, dol_offset(data, pc))[0]
+        instruction = struct.unpack_from(">I", data, dol_offset(data, pc))[0]
         if instruction & 0xFC000003 == 0x48000001:
             delta = instruction & 0x03FFFFFC
             if delta & 0x02000000:
@@ -68,32 +82,97 @@ def call_site(data, syms, owner, target):
             if pc + delta == syms[target][0]:
                 found.append((pc, instruction))
     if len(found) != 1:
-        raise ValueError(f'Expected exactly one {target} call in {owner}, got {found}')
+        raise ValueError(f"Expected exactly one {target} call in {owner}, got {found}")
     return found[0]
+
+
+def unique_json_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(f"Duplicate JSON key: {name}")
+        result[name] = value
+    return result
+
+
+def resolve_call_hooks(document, data, syms, forbidden=()):
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"version", "hooks"}
+        or type(document["version"]) is not int
+        or document["version"] != 1
+        or not isinstance(document["hooks"], dict)
+    ):
+        raise ValueError(
+            "Invalid hook configuration; expected version 1 and a hooks object"
+        )
+    resolved = []
+    addresses = set(forbidden)
+    for name, spec in sorted(document["hooks"].items()):
+        if (
+            not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name)
+            or not isinstance(spec, dict)
+            or set(spec) != {"owner", "callee"}
+            or not all(isinstance(value, str) and value for value in spec.values())
+        ):
+            raise ValueError(f"Invalid call hook declaration: {name}")
+        address, expected = call_site(data, syms, spec["owner"], spec["callee"])
+        if address in addresses:
+            raise ValueError(f"Overlapping hook site: {name} at 0x{address:08X}")
+        addresses.add(address)
+        resolved.append(dict(name=name, address=address, expected=expected, **spec))
+    return resolved
+
+
+def hook_sites_header(hooks):
+    return (
+        "#pragma once\n// Generated by tools/build_archipelago.py; do not edit.\n"
+        + "".join(
+            f'#define AP_HOOK_{hook["name"]} 0x{hook["address"]:08X}u\n'
+            for hook in hooks
+        )
+    )
+
+
+def hook_checks_header(hooks):
+    rows = "".join(
+        f'    {{0x{h["address"]:08X}u, 0x{h["expected"]:08X}u, '
+        f'0x{h["target_offset"]:X}u}},\n'
+        for h in hooks
+    )
+    return (
+        f"#define AP_CALL_HOOK_COUNT {len(hooks)}u\n"
+        "struct APCallHook { unsigned int address, original, targetOffset; };\n"
+        "static const APCallHook sAPCallHooks[] = {\n"
+        + (rows or "    {0, 0, 0},\n")
+        + "};\n"
+    )
 
 
 def branch(pc, target):
     delta = target - pc
     if delta % 4 or not -0x02000000 <= delta < 0x02000000:
-        raise ValueError('PowerPC branch out of range')
+        raise ValueError("PowerPC branch out of range")
     return 0x48000001 | (delta & 0x03FFFFFC)
 
 
 def arena_start(data, syms):
-    pc = syms['__init_registers'][0]
-    raw = data[dol_offset(data, pc, syms['__init_registers'][1]):][:syms['__init_registers'][1]]
+    pc = syms["__init_registers"][0]
+    raw = data[dol_offset(data, pc, syms["__init_registers"][1]) :][
+        : syms["__init_registers"][1]
+    ]
     candidates = []
-    words = struct.unpack('>' + 'I' * (len(raw) // 4), raw)
+    words = struct.unpack(">" + "I" * (len(raw) // 4), raw)
     for hi, lo in zip(words, words[1:]):
         if hi & 0xFFFF0000 == 0x3C200000 and lo & 0xFFFF0000 == 0x60210000:
             candidates.append(((hi & 0xFFFF) << 16) | (lo & 0xFFFF))
     if len(candidates) != 1:
-        raise ValueError('Unrecognized retail stack initialization')
+        raise ValueError("Unrecognized retail stack initialization")
     # Retail LCF: debug stack follows the main stack by 0x2000; ArenaLo is rounded to 32.
     base = align(candidates[0] + 0x2000)
-    bss, size = struct.unpack_from('>II', data, 0xD8)
+    bss, size = struct.unpack_from(">II", data, 0xD8)
     if not bss + size <= base < 0x81700000:
-        raise ValueError('Bootstrap would overlap retail static memory or stack')
+        raise ValueError("Bootstrap would overlap retail static memory or stack")
     return base
 
 
@@ -104,28 +183,67 @@ def fnv(data):
     return value
 
 
-def validate_module(binary):
+def inspect_module(binary, call_hooks=()):
     if len(binary) < 32:
-        raise ValueError('Truncated Kamek header')
-    magic, version, bss, code, first, last, pad0, pad1 = struct.unpack_from('>8I', binary)
-    if ((magic, version) != (0x4B616D65, 0x6B000002) or bss + code > 0x01800000 or
-            not 0 <= first <= last <= code or first % 4 or last % 4 or code + 32 > len(binary) or pad0 or pad1):
-        raise ValueError('Invalid Kamek header')
+        raise ValueError("Truncated Kamek header")
+    magic, version, bss, code, first, last, pad0, pad1 = struct.unpack_from(
+        ">8I", binary
+    )
+    if (
+        (magic, version) != (0x4B616D65, 0x6B000002)
+        or bss + code > 0x01800000
+        or not 0 <= first <= last <= code
+        or first % 4
+        or last % 4
+        or code + 32 > len(binary)
+        or pad0
+        or pad1
+    ):
+        raise ValueError("Invalid Kamek header")
+    allowed = {hook["address"]: hook for hook in call_hooks}
+    if len(allowed) != len(call_hooks):
+        raise ValueError("Duplicate allowed call hook address")
+    installed = []
+    seen = set()
     position = 32 + code
     while position < len(binary):
         if position + 8 > len(binary):
-            raise ValueError('Truncated relocation')
-        command, target = struct.unpack_from('>2I', binary, position)
+            raise ValueError("Truncated relocation")
+        command = struct.unpack_from(">I", binary, position)[0]
+        position += 4
         kind, offset = command >> 24, command & 0xFFFFFF
-        if kind not in (1, 4, 5, 6, 10) or offset == 0xFFFFFE:
-            raise ValueError('Module patch commands require an explicit regional hook manifest; mailbox target accepts internal relocations only')
+        if offset == 0xFFFFFE:
+            if position + 8 > len(binary):
+                raise ValueError("Truncated absolute patch command")
+            address, target = struct.unpack_from(">2I", binary, position)
+            position += 8
+            if kind != 65 or address not in allowed:
+                raise ValueError(
+                    f"Undeclared or unsupported module patch at 0x{address:08X}"
+                )
+            if address in seen:
+                raise ValueError(f"Duplicate module patch at 0x{address:08X}")
+            if target % 4 or target + 4 > code:
+                raise ValueError(
+                    "Call hook target must be aligned code inside the AP module"
+                )
+            seen.add(address)
+            installed.append(dict(**allowed[address], target_offset=target))
+            continue
+        if kind not in (1, 4, 5, 6, 10):
+            raise ValueError("Unsupported relative module patch command")
+        target = struct.unpack_from(">I", binary, position)[0]
+        position += 4
         width = 2 if kind in (4, 5, 6) else 4
         if offset + width > code + bss or offset % width:
-            raise ValueError('Relocation destination outside module or misaligned')
+            raise ValueError("Relocation destination outside module or misaligned")
         if not (target < code + bss or 0x80000000 <= target < 0x81800000):
-            raise ValueError('Relocation target outside MEM1/module')
-        position += 8
-    return bss, code, first, last
+            raise ValueError("Relocation target outside MEM1/module")
+    return (bss, code, first, last), installed
+
+
+def validate_module(binary, call_hooks=()):
+    return inspect_module(binary, call_hooks)[0]
 
 
 def run(args):
@@ -134,188 +252,376 @@ def run(args):
 
 def prepare_game(source, output, region, dol, module):
     source = source.resolve()
-    if not (source / 'sys/boot.bin').is_file() or not (source / 'files').is_dir():
-        raise ValueError('--game-dir must be the extracted DATA folder containing sys/ and files/')
-    boot = (source / 'sys/boot.bin').read_bytes()
+    if not (source / "sys/boot.bin").is_file() or not (source / "files").is_dir():
+        raise ValueError(
+            "--game-dir must be the extracted DATA folder containing sys/ and files/"
+        )
+    boot = (source / "sys/boot.bin").read_bytes()
     if len(boot) < 8 or boot[:6] != region.encode() or boot[7] != 0:
-        raise ValueError('Extracted game region mismatch')
+        raise ValueError("Extracted game region mismatch")
     if output.resolve().is_relative_to(source):
-        raise ValueError('Test output must be outside the source game')
-    marker = output / '.archipelago-test-copy.json'
+        raise ValueError("Test output must be outside the source game")
+    marker = output / ".archipelago-test-copy.json"
     if output.exists():
         if not marker.is_file():
-            raise ValueError(f'Output is not an owned AP test copy: {output}')
+            raise ValueError(f"Output is not an owned AP test copy: {output}")
         previous = json.loads(marker.read_text())
-        if previous['region'] != region or previous['source'] != str(source):
-            raise ValueError('Test copy ownership/region mismatch')
-        current = output / 'sys/main.dol'
-        if current.is_symlink() or hashlib.sha256(current.read_bytes()).hexdigest() != previous['dol_sha256']:
-            raise ValueError('Test DOL changed outside this build; refusing to overwrite it')
+        if previous["region"] != region or previous["source"] != str(source):
+            raise ValueError("Test copy ownership/region mismatch")
+        current = output / "sys/main.dol"
+        if (
+            current.is_symlink()
+            or hashlib.sha256(current.read_bytes()).hexdigest()
+            != previous["dol_sha256"]
+        ):
+            raise ValueError(
+                "Test DOL changed outside this build; refusing to overwrite it"
+            )
     else:
         output.mkdir(parents=True)
-        run(['cp', '-a', '--reflink=auto', str(source) + '/.', output])
-    replacements = {'sys/main.dol': dol,
-                    'files/ModuleData/product.sel': ROOT / f'orig/{region}/files/ModuleData/product.sel',
-                    f'files/Archipelago/{region}.bin': module}
+        run(["cp", "-a", "--reflink=auto", str(source) + "/.", output])
+    replacements = {
+        "sys/main.dol": dol,
+        "files/ModuleData/product.sel": ROOT
+        / f"orig/{region}/files/ModuleData/product.sel",
+        f"files/Archipelago/{region}.bin": module,
+    }
     for relative, input_file in replacements.items():
         target = output / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.parent.resolve() != target.parent.absolute():
-            raise ValueError('Refusing a symlinked deployment directory')
-        temporary = target.with_name(target.name + '.ap-tmp')
+            raise ValueError("Refusing a symlinked deployment directory")
+        temporary = target.with_name(target.name + ".ap-tmp")
         if temporary.is_symlink():
-            raise ValueError('Unexpected temporary symlink')
+            raise ValueError("Unexpected temporary symlink")
         shutil.copyfile(input_file, temporary)
         temporary.replace(target)
-    marker.write_text(json.dumps(dict(region=region, source=str(source),
-                      dol_sha256=hashlib.sha256(dol.read_bytes()).hexdigest()), indent=2))
+    marker.write_text(
+        json.dumps(
+            dict(
+                region=region,
+                source=str(source),
+                dol_sha256=hashlib.sha256(dol.read_bytes()).hexdigest(),
+            ),
+            indent=2,
+        )
+    )
 
 
 def deploy_game(out, region, dol, module, game_dir=None, game_output=None):
     if game_output is not None and game_dir is None:
-        raise ValueError('--game-output requires --game-dir')
-    output = game_output if game_output is not None else out / 'game/DATA'
+        raise ValueError("--game-output requires --game-dir")
+    output = game_output if game_output is not None else out / "game/DATA"
     if game_dir is None:
-        marker = output / '.archipelago-test-copy.json'
+        marker = output / ".archipelago-test-copy.json"
         if not marker.is_file():
             return None
         previous = json.loads(marker.read_text())
-        if previous.get('region') != region or not isinstance(previous.get('source'), str):
-            raise ValueError('Invalid private game copy marker')
-        game_dir = Path(previous['source'])
+        if previous.get("region") != region or not isinstance(
+            previous.get("source"), str
+        ):
+            raise ValueError("Invalid private game copy marker")
+        game_dir = Path(previous["source"])
     prepare_game(game_dir, output, region, dol, module)
     return output
 
 
-
 def build(region, game_dir=None, game_output=None):
     if game_output is not None and game_dir is None:
-        raise ValueError('--game-output requires --game-dir')
-    out = ROOT / 'build/kamek' / region
+        raise ValueError("--game-output requires --game-dir")
+    out = ROOT / "build/kamek" / region
     out.mkdir(parents=True, exist_ok=True)
-    original = (ROOT / f'orig/{region}/sys/main.dol').read_bytes()
+    original = (ROOT / f"orig/{region}/sys/main.dol").read_bytes()
     if hashlib.sha1(original).hexdigest() != REGIONS[region]:
-        raise ValueError('Unsupported original DOL hash')
+        raise ValueError("Unsupported original DOL hash")
     syms = symbols(region)
     base = arena_start(original, syms)
-    hooks = [(*call_site(original, syms, 'OSInit', 'OSSetMEM1ArenaLo'), 'apReserveArena'),
-             (*call_site(original, syms, 'main', 'createRootHeap__17HeapMemoryWatcherFv'), 'apLoadAndCreateRootHeap')]
-    kamek = ROOT / 'vendor/Kamek'
-    tool_out = ROOT / 'build/kamek/tools'
-    run(['dotnet', 'build', kamek / 'Source/Kamek.csproj', '-c', 'Release', '-p:PublishTrimmed=false', '-o', tool_out])
-    linker = ['dotnet', tool_out / 'Kamek.dll']
-    externals = out / 'symbols.txt'
-    allowed_name = re.compile(r'^[a-zA-Z0-9_<>@,\-\\$]+$')
-    global_names = {line.split(' = ')[0] for line in (ROOT / f'config/{region}/symbols.txt').read_text().splitlines() if 'scope:global' in line}
-    externals.write_text(''.join(f'{name}=0x{addr:08X}\n' for name, (addr, _) in syms.items()
-                                 if allowed_name.fullmatch(name) and name in global_names))
-    flags = ['-c', '-nodefaults', '-proc', 'gekko', '-align', 'powerpc', '-enum', 'int',
-             '-fp', 'hardware', '-Cpp_exceptions', 'off', '-RTTI', 'off', '-O4,p',
-             '-inline', 'auto', '-use_lmw_stmw', 'on', '-sdata', '0', '-sdata2', '0',
-             '-nosyspath', '-I-']
-    for include in ['include', 'libs/RVL_SDK/include', 'libs/JSystem/include', 'libs/MSL_C/include',
-                    'libs/MSL_C++/include', 'libs/Runtime/include', 'libs/MetroTRK/include',
-                    'libs/RVLFaceLib/include', 'libs/nw4r/include',
-                    'vendor/Kamek/k_stdlib', 'vendor/Kamek/loader']:
-        flags += ['-i', ROOT / include]
-    flags += ['-i', ROOT / 'build' / region / 'include', '-i', out]
-    for index, version in enumerate(['RMGJ01', 'RMGE01', 'RMGP01', 'RMGK01']):
-        flags += ['-d', f'{version}={index}']
-    flags += ['-d', f"VERSION={['RMGJ01', 'RMGE01', 'RMGP01', 'RMGK01'].index(region)}"]
+    hooks = [
+        (*call_site(original, syms, "OSInit", "OSSetMEM1ArenaLo"), "apReserveArena"),
+        (
+            *call_site(original, syms, "main", "createRootHeap__17HeapMemoryWatcherFv"),
+            "apLoadAndCreateRootHeap",
+        ),
+    ]
+    hook_specs = json.loads(
+        (ROOT / "config/Archipelago/hooks.json").read_text(),
+        object_pairs_hook=unique_json_object,
+    )
+    call_hooks = resolve_call_hooks(
+        hook_specs, original, syms, [hook[0] for hook in hooks]
+    )
+    (out / "ArchipelagoHookSites.generated.hpp").write_text(
+        hook_sites_header(call_hooks)
+    )
+    kamek = ROOT / "vendor/Kamek"
+    tool_out = ROOT / "build/kamek/tools"
+    run(
+        [
+            "dotnet",
+            "build",
+            kamek / "Source/Kamek.csproj",
+            "-c",
+            "Release",
+            "-p:PublishTrimmed=false",
+            "-o",
+            tool_out,
+        ]
+    )
+    linker = ["dotnet", tool_out / "Kamek.dll"]
+    externals = out / "symbols.txt"
+    allowed_name = re.compile(r"^[a-zA-Z0-9_<>@,\-\\$]+$")
+    global_names = {
+        line.split(" = ")[0]
+        for line in (ROOT / f"config/{region}/symbols.txt").read_text().splitlines()
+        if "scope:global" in line
+    }
+    externals.write_text(
+        "".join(
+            f"{name}=0x{addr:08X}\n"
+            for name, (addr, _) in syms.items()
+            if allowed_name.fullmatch(name) and name in global_names
+        )
+    )
+    flags = [
+        "-c",
+        "-nodefaults",
+        "-proc",
+        "gekko",
+        "-align",
+        "powerpc",
+        "-enum",
+        "int",
+        "-fp",
+        "hardware",
+        "-Cpp_exceptions",
+        "off",
+        "-RTTI",
+        "off",
+        "-O4,p",
+        "-inline",
+        "auto",
+        "-use_lmw_stmw",
+        "on",
+        "-sdata",
+        "0",
+        "-sdata2",
+        "0",
+        "-nosyspath",
+        "-I-",
+    ]
+    for include in [
+        "include",
+        "libs/RVL_SDK/include",
+        "libs/JSystem/include",
+        "libs/MSL_C/include",
+        "libs/MSL_C++/include",
+        "libs/Runtime/include",
+        "libs/MetroTRK/include",
+        "libs/RVLFaceLib/include",
+        "libs/nw4r/include",
+        "vendor/Kamek/k_stdlib",
+        "vendor/Kamek/loader",
+    ]:
+        flags += ["-i", ROOT / include]
+    flags += ["-i", ROOT / "build" / region / "include", "-i", out]
+    for index, version in enumerate(["RMGJ01", "RMGE01", "RMGP01", "RMGK01"]):
+        flags += ["-d", f"{version}={index}"]
+    flags += ["-d", f"VERSION={['RMGJ01', 'RMGE01', 'RMGP01', 'RMGK01'].index(region)}"]
+
     def compile(source, name):
         target = out / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        run([ROOT / 'build/tools/wibo', ROOT / 'build/compilers/GC/3.0a5/mwcceppc.exe', *flags, source, '-o', target])
+        run(
+            [
+                ROOT / "build/tools/wibo",
+                ROOT / "build/compilers/GC/3.0a5/mwcceppc.exe",
+                *flags,
+                source,
+                "-o",
+                target,
+            ]
+        )
         return target
-    source_root = ROOT / 'src/Game/Archipelago'
-    objects = [compile(p, Path('module') / p.relative_to(source_root).with_suffix('.o'))
-               for p in sorted(source_root.rglob('*.cpp'))]
+
+    source_root = ROOT / "src/Game/Archipelago"
+    objects = [
+        compile(p, Path("module") / p.relative_to(source_root).with_suffix(".o"))
+        for p in sorted(source_root.rglob("*.cpp"))
+    ]
     if not objects:
-        raise ValueError('No AP sources')
-    module = out / f'{region}.bin'
-    run([*linker, *objects, '-dynamic', f'-externals={externals}', f'-output-kamek={module}', f'-output-map={out}/module.map'])
+        raise ValueError("No AP sources")
+    module = out / f"{region}.bin"
+    run(
+        [
+            *linker,
+            *objects,
+            "-dynamic",
+            f"-externals={externals}",
+            f"-output-kamek={module}",
+            f"-output-map={out}/module.map",
+        ]
+    )
     binary = module.read_bytes()
-    bss, code, ctor_start, ctor_end = validate_module(binary)
-    module_syms = map_symbols(out / 'module.map')
-    mailbox, mailbox_size = module_syms['gArchipelagoMailbox']
-    ready, ready_size = module_syms['gArchipelagoModuleReady']
-    if mailbox_size != 12 or ready_size != 4 or mailbox + 12 > code or ready + 4 > code + bss:
-        raise ValueError('Unexpected module protocol symbols')
-    config = {'AP_BOOT_BASE': base, 'AP_REGION': int.from_bytes(region[:4].encode(), 'big'),
-              'AP_FILE_SIZE': len(binary), 'AP_FILE_HASH': fnv(binary), 'AP_CODE_SIZE': code,
-              'AP_BSS_SIZE': bss, 'AP_MODULE_SIZE': code + bss, 'AP_MAILBOX_OFFSET': mailbox,
-              'AP_READY_OFFSET': ready}
-    (out / 'BootstrapConfig.hpp').write_text(''.join(f'#define {name} 0x{value:X}u\n' for name, value in config.items()) + f'#define AP_MODULE_PATH "/Archipelago/{region}.bin"\n')
-    bootstrap_objects = [compile(kamek / 'loader/kamekLoader.cpp', 'KamekLoader.o'),
-                         compile(ROOT / 'loader/ArchipelagoBootstrap.cpp', 'Bootstrap.o')]
-    run([*linker, *bootstrap_objects, f'-static=0x{base:X}', f'-externals={externals}',
-         f'-output-code={out}/bootstrap-code.bin', f'-output-map={out}/bootstrap.map'])
-    boot_syms = map_symbols(out / 'bootstrap.map')
-    boot = (out / 'bootstrap-code.bin').read_bytes()
-    boot = boot.ljust(align(boot_syms['_e_bss'][0] - base), b'\0')
-    (out / 'bootstrap.bin').write_bytes(boot)
+    (bss, code, ctor_start, ctor_end), installed_hooks = inspect_module(
+        binary, call_hooks
+    )
+    module_syms = map_symbols(out / "module.map")
+    mailbox, mailbox_size = module_syms["gArchipelagoMailbox"]
+    ready, ready_size = module_syms["gArchipelagoModuleReady"]
+    if (
+        mailbox_size != 12
+        or ready_size != 4
+        or mailbox + mailbox_size > code
+        or ready + ready_size > code + bss
+    ):
+        raise ValueError("Unexpected module protocol symbols")
+    config = {
+        "AP_BOOT_BASE": base,
+        "AP_REGION": int.from_bytes(region[:4].encode(), "big"),
+        "AP_FILE_SIZE": len(binary),
+        "AP_FILE_HASH": fnv(binary),
+        "AP_CODE_SIZE": code,
+        "AP_BSS_SIZE": bss,
+        "AP_MODULE_SIZE": code + bss,
+        "AP_MAILBOX_OFFSET": mailbox,
+        "AP_READY_OFFSET": ready,
+    }
+    (out / "BootstrapConfig.hpp").write_text(
+        "".join(f"#define {name} 0x{value:X}u\n" for name, value in config.items())
+        + f'#define AP_MODULE_PATH "/Archipelago/{region}.bin"\n'
+        + hook_checks_header(installed_hooks)
+    )
+    bootstrap_objects = [
+        compile(kamek / "loader/kamekLoader.cpp", "KamekLoader.o"),
+        compile(ROOT / "loader/ArchipelagoBootstrap.cpp", "Bootstrap.o"),
+    ]
+    run(
+        [
+            *linker,
+            *bootstrap_objects,
+            f"-static=0x{base:X}",
+            f"-externals={externals}",
+            f"-output-code={out}/bootstrap-code.bin",
+            f"-output-map={out}/bootstrap.map",
+        ]
+    )
+    boot_syms = map_symbols(out / "bootstrap.map")
+    boot = (out / "bootstrap-code.bin").read_bytes()
+    boot = boot.ljust(align(boot_syms["_e_bss"][0] - base), b"\0")
+    (out / "bootstrap.bin").write_bytes(boot)
     patched = bytearray(original)
     changes = []
     for address, expected, name in hooks:
         replacement = branch(address, boot_syms[name][0])
-        struct.pack_into('>I', patched, dol_offset(original, address), replacement)
-        changes.append(dict(address=address, expected=expected, replacement=replacement, target=name))
+        struct.pack_into(">I", patched, dol_offset(original, address), replacement)
+        changes.append(
+            dict(
+                address=address, expected=expected, replacement=replacement, target=name
+            )
+        )
     sections = dol_sections(original)
     slot = next(i for i in range(7) if sections[i][2] == 0)
     offset = align(len(patched))
     patched.extend(bytes(offset - len(patched)))
     patched.extend(boot)
-    for header, value in [(slot * 4, offset), (0x48 + slot * 4, base), (0x90 + slot * 4, len(boot))]:
-        struct.pack_into('>I', patched, header, value)
+    for header, value in [
+        (slot * 4, offset),
+        (0x48 + slot * 4, base),
+        (0x90 + slot * 4, len(boot)),
+    ]:
+        struct.pack_into(">I", patched, header, value)
     # Prove only the two declared retail instruction words have changed.
     for fileoff, address, size in sections:
-        expected = bytearray(original[fileoff:fileoff + size])
+        expected = bytearray(original[fileoff : fileoff + size])
         for change in changes:
-            if address <= change['address'] < address + size:
-                struct.pack_into('>I', expected, change['address'] - address, change['replacement'])
-        if patched[fileoff:fileoff + size] != expected:
-            raise ValueError('Unexpected retail section modification')
+            if address <= change["address"] < address + size:
+                struct.pack_into(
+                    ">I", expected, change["address"] - address, change["replacement"]
+                )
+        if patched[fileoff : fileoff + size] != expected:
+            raise ValueError("Unexpected retail section modification")
     if patched[0xD8:0xE4] != original[0xD8:0xE4]:
-        raise ValueError('Retail BSS or entry point changed')
-    if any(size and max(base, addr) < min(base + len(boot), addr + size) for _, addr, size in sections):
-        raise ValueError('Bootstrap overlaps a retail section')
-    dol = out / 'main.dol'; dol.write_bytes(patched)
-    manifest = dict(region=region, retail_sha1=REGIONS[region], module_sha256=hashlib.sha256(binary).hexdigest(),
-                    bootstrap_base=base, bootstrap_size=len(boot), discovery=boot_syms['gArchipelagoDiscovery'][0],
-                    module_size=code + bss, code_size=code, bss_size=bss, mailbox_offset=mailbox,
-                    ready_offset=ready, hooks=changes, retail_sections_verified=True)
-    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    disc = ET.Element('wiidisc', version='1')
-    game_id = ET.SubElement(disc, 'id', game='RMG', developer='01')
-    ET.SubElement(game_id, 'region', type=region[3])
-    options = ET.SubElement(disc, 'options'); section = ET.SubElement(options, 'section', name='Archipelago')
-    option = ET.SubElement(section, 'option', name='AP mailbox (experimental)'); choice = ET.SubElement(option, 'choice', name='Enabled')
-    ET.SubElement(choice, 'patch', id='ap-mailbox'); patch = ET.SubElement(disc, 'patch', id='ap-mailbox')
-    ET.SubElement(patch, 'memory', offset=f'0x{base:08X}', valuefile=f'/Archipelago/{region}/bootstrap.bin')
+        raise ValueError("Retail BSS or entry point changed")
+    if any(
+        size and max(base, addr) < min(base + len(boot), addr + size)
+        for _, addr, size in sections
+    ):
+        raise ValueError("Bootstrap overlaps a retail section")
+    dol = out / "main.dol"
+    dol.write_bytes(patched)
+    manifest = dict(
+        region=region,
+        retail_sha1=REGIONS[region],
+        module_sha256=hashlib.sha256(binary).hexdigest(),
+        bootstrap_base=base,
+        bootstrap_size=len(boot),
+        discovery=boot_syms["gArchipelagoDiscovery"][0],
+        module_size=code + bss,
+        code_size=code,
+        bss_size=bss,
+        mailbox_offset=mailbox,
+        ready_offset=ready,
+        hooks=changes,
+        module_hooks=installed_hooks,
+        retail_sections_verified=True,
+    )
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    disc = ET.Element("wiidisc", version="1")
+    game_id = ET.SubElement(disc, "id", game="RMG", developer="01")
+    ET.SubElement(game_id, "region", type=region[3])
+    options = ET.SubElement(disc, "options")
+    section = ET.SubElement(options, "section", name="Archipelago")
+    option = ET.SubElement(section, "option", name="AP mailbox (experimental)")
+    choice = ET.SubElement(option, "choice", name="Enabled")
+    ET.SubElement(choice, "patch", id="ap-mailbox")
+    patch = ET.SubElement(disc, "patch", id="ap-mailbox")
+    ET.SubElement(
+        patch,
+        "memory",
+        offset=f"0x{base:08X}",
+        valuefile=f"/Archipelago/{region}/bootstrap.bin",
+    )
     for c in changes:
-        ET.SubElement(patch, 'memory', offset=f'0x{c["address"]:08X}', value=f'{c["replacement"]:08X}', original=f'{c["expected"]:08X}')
-    ET.SubElement(patch, 'file', disc=f'/Archipelago/{region}.bin', external=f'/Archipelago/{region}/{region}.bin', create='true')
-    ET.indent(disc); ET.ElementTree(disc).write(out / f'{region}.xml', encoding='utf-8', xml_declaration=True)
+        ET.SubElement(
+            patch,
+            "memory",
+            offset=f'0x{c["address"]:08X}',
+            value=f'{c["replacement"]:08X}',
+            original=f'{c["expected"]:08X}',
+        )
+    ET.SubElement(
+        patch,
+        "file",
+        disc=f"/Archipelago/{region}.bin",
+        external=f"/Archipelago/{region}/{region}.bin",
+        create="true",
+    )
+    ET.indent(disc)
+    ET.ElementTree(disc).write(
+        out / f"{region}.xml", encoding="utf-8", xml_declaration=True
+    )
     deployed = deploy_game(out, region, dol, module, game_dir, game_output)
     if deployed is not None:
         print(f'Private game copy updated: {deployed / "sys/main.dol"}')
     else:
-        print('No private game copy prepared. Use --game-dir /path/to/DATA to create one.')
+        print(
+            "No private game copy prepared. Use --game-dir /path/to/DATA to create one."
+        )
     print(json.dumps(manifest, indent=2))
     return manifest
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('region', choices=REGIONS)
-    parser.add_argument('--game-dir', type=Path)
-    parser.add_argument('--game-output', type=Path)
+    parser.add_argument("region", choices=REGIONS)
+    parser.add_argument("--game-dir", type=Path)
+    parser.add_argument("--game-output", type=Path)
     args = parser.parse_args()
     try:
         build(args.region, args.game_dir, args.game_output)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
-        parser.exit(1, f'AP build failed: {error}\n')
+        parser.exit(1, f"AP build failed: {error}\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
