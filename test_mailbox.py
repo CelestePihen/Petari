@@ -4,6 +4,7 @@
 import argparse
 import configparser
 import json
+import math
 from pathlib import Path
 import os
 import struct
@@ -22,6 +23,12 @@ from archipelago_protocol import (
     EVENT_CAPACITY,
     EVENT_SIZE,
     GALAXY_NAME_SIZE,
+    INCOMING_EVENTS_OFFSET,
+    INCOMING_ITEM_SIZE,
+    INCOMING_QUEUE_OFFSET,
+    INCOMING_QUEUE_SIZE,
+    INCOMING_READ_COUNT_OFFSET,
+    INCOMING_WRITE_COUNT_OFFSET,
 )
 
 MEM1_START, MEM1_END = 0x80000000, 0x81800000
@@ -440,7 +447,14 @@ def ack_star_events(dme, mailbox_address: int, queue: dict) -> int:
     return len(queue["events"])
 
 
-def watch_star_events(dme, mailbox_address: int, acknowledge: bool = False):
+def watch_star_events(
+    dme,
+    mailbox_address: int,
+    acknowledge: bool = False,
+    *,
+    send_pending_item=None,
+    stop_after_item: bool = False,
+):
     """
     Surveille les événements StarCollected pendant l'exécution du jeu.
 
@@ -451,6 +465,9 @@ def watch_star_events(dme, mailbox_address: int, acknowledge: bool = False):
         dme: Interface de communication avec Dolphin.
         mailbox_address (int): Adresse de la mailbox Archipelago.
         acknowledge (bool): Indique si les événements doivent être acquittés.
+        send_pending_item: Envoie l'item si son délai est écoulé et renvoie
+            True une fois l'envoi effectué.
+        stop_after_item (bool): Termine la surveillance après cet envoi.
     """
     print("Watching star events... Press Ctrl+C to stop.")
 
@@ -482,10 +499,108 @@ def watch_star_events(dme, mailbox_address: int, acknowledge: bool = False):
 
                 last_read_count = (queue["readCount"] + count) & 0xFFFFFFFF
 
+            if send_pending_item is not None:
+                if send_pending_item() and stop_after_item:
+                    break
+
             time.sleep(0.1)
 
     except KeyboardInterrupt:
         print("\nStopped watching star events.")
+
+
+def send_test_item(dme, mailbox_address: int, item_id=2, item_index=0):
+    """
+    Ajoute un événement de test dans la file Python → Jeu.
+
+    Args:
+        dme: Interface dolphin-memory-engine.
+        mailbox_address (int): Adresse de la mailbox.
+        item_id (int): Identifiant de l'item à envoyer.
+        item_index (int): Index de l'item dans la séquence Archipelago.
+
+    Returns:
+        int: Numéro de séquence de l'événement envoyé.
+
+    Raises:
+        RuntimeError: Si la file est pleine ou si une écriture échoue.
+    """
+    write_address = mailbox_address + INCOMING_WRITE_COUNT_OFFSET
+    read_address = mailbox_address + INCOMING_READ_COUNT_OFFSET
+
+    write_count = dme.read_word(write_address)
+    read_count = dme.read_word(read_address)
+
+    pending = (write_count - read_count) & 0xFFFFFFFF
+
+    if pending >= EVENT_CAPACITY:
+        raise RuntimeError("Incoming item queue is full")
+
+    slot = write_count % EVENT_CAPACITY
+    event_address = mailbox_address + INCOMING_EVENTS_OFFSET + slot * INCOMING_ITEM_SIZE
+
+    event = struct.pack(">2I", item_id, item_index)
+
+    dme.write_bytes(event_address, event)
+
+    if bytes(dme.read_bytes(event_address, INCOMING_ITEM_SIZE)) != event:
+        raise RuntimeError("Incoming item write verification failed")
+
+    dme.write_word(write_address, (write_count + 1) & 0xFFFFFFFF)
+
+    return write_count
+
+
+def read_incoming_items(read_bytes, mailbox_address):
+    """Lit les événements présents dans la file Python -> Jeu"""
+    address = mailbox_address + INCOMING_QUEUE_OFFSET
+
+    write_count, read_count = struct.unpack(">2I", bytes(read_bytes(address, 8)))
+
+    pending = (write_count - read_count) & 0xFFFFFFFF
+
+    if pending > EVENT_CAPACITY:
+        raise RuntimeError("Invalid incoming item queue state")
+
+    events = []
+
+    for sequence in range(read_count, read_count + pending):
+        slot = sequence % EVENT_CAPACITY
+        event_address = (
+            mailbox_address + INCOMING_EVENTS_OFFSET + slot * INCOMING_ITEM_SIZE
+        )
+
+        item_id, item_index = struct.unpack(
+            ">2I", bytes(read_bytes(event_address, INCOMING_ITEM_SIZE))
+        )
+
+        events.append(
+            {
+                "sequence": sequence & 0xFFFFFFFF,
+                "itemId": item_id,
+                "itemIndex": item_index,
+            }
+        )
+
+    return {
+        "writeCount": write_count,
+        "readCount": read_count,
+        "pending": pending,
+        "events": events,
+    }
+
+
+def parse_test_item_ids(value):
+    """Parse a comma-separated list of unsigned 32-bit item IDs."""
+    try:
+        item_ids = [int(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integer item IDs (e.g. 200,201,202)"
+        ) from exc
+    if any(not 0 <= item_id <= 0xFFFFFFFF for item_id in item_ids):
+        raise argparse.ArgumentTypeError("item IDs must be unsigned 32-bit integers")
+    return item_ids
 
 
 def main():
@@ -564,7 +679,64 @@ def main():
         help="Continuously monitor star events until Ctrl+C",
     )
 
+    parser.add_argument(
+        "--send-test-item",
+        action="store_true",
+        help="Send a test item to the incoming item queue",
+    )
+
+    parser.add_argument(
+        "--send-test-stars",
+        type=int,
+        default=0,
+        metavar="COUNT",
+        help="Send COUNT test Power Stars to the game",
+    )
+
+    item_id_options = parser.add_mutually_exclusive_group()
+    item_id_options.add_argument(
+        "--send-test-item-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Send an Archipelago item with the specified ID",
+    )
+
+    item_id_options.add_argument(
+        "--send-test-item-ids",
+        type=parse_test_item_ids,
+        metavar="ID,ID,...",
+        help="Send Archipelago items in the specified comma-separated order",
+    )
+
+    parser.add_argument(
+        "--send-test-item-delay",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="Delay --send-test-item-id or --send-test-item-ids by SECONDS after attaching to Dolphin (default: 0)",
+    )
+
     args = parser.parse_args()
+    test_item_ids = args.send_test_item_ids
+    if test_item_ids is None:
+        test_item_ids = [] if args.send_test_item_id is None else [args.send_test_item_id]
+
+    if test_item_ids and args.read_only:
+        parser.error("--send-test-item-id/--send-test-item-ids requires write access")
+
+    if not math.isfinite(args.send_test_item_delay) or args.send_test_item_delay < 0:
+        parser.error("--send-test-item-delay must be finite and nonnegative")
+
+    if args.send_test_stars < 0:
+        parser.error("--send-test-stars must be nonnegative")
+
+    if args.send_test_stars and args.read_only:
+        parser.error("--send-test-stars requires write access")
+
+    if args.send_test_item and args.read_only:
+        parser.error("--send-test-item requires write access to Dolphin")
+
     if args.ack_events and args.read_only:
         parser.error("--ack-events cannot be used with --read-only")
 
@@ -648,7 +820,7 @@ def main():
 
             command = [
                 executable,
-                "-b",
+                # "-b",
                 "-e",
                 str(args.launch.resolve()),
                 "-C",
@@ -677,6 +849,7 @@ def main():
 
         deadline = time.monotonic() + args.timeout
         result = None
+        attached_at = None
 
         while time.monotonic() < deadline:
             if child and child.poll() is not None:
@@ -699,6 +872,15 @@ def main():
                         "--read-only --shared-memory-pid <DOLPHIN_PID>; for DME writes, "
                         "launch Dolphin with --launch. No system permission changes are required."
                     ) from exc
+                if attached_at is None:
+                    attached_at = time.monotonic()
+                    if test_item_ids and args.send_test_item_delay > 0:
+                        scheduled_items = ", ".join(f"itemId={item_id}" for item_id in test_item_ids)
+                        print(
+                            f"Scheduled test item(s): {scheduled_items}, "
+                            f"delay={args.send_test_item_delay:g}s after Dolphin attachment",
+                            flush=True,
+                        )
                 if region in ("RMGP01", "RMGE01") and (
                     args.region is None or region == args.region
                 ):
@@ -750,6 +932,27 @@ def main():
             result["written"] = args.value
             result["readback"] = value
 
+        item_sent = False
+        item_send_at = attached_at + args.send_test_item_delay
+
+        def send_pending_item():
+            nonlocal item_sent
+            if not item_sent and time.monotonic() >= item_send_at:
+                for index, item_id in enumerate(test_item_ids):
+                    sequence = send_test_item(
+                        dme,
+                        address,
+                        item_id=item_id,
+                        item_index=index,
+                    )
+                    print(
+                        f"Sent test item: itemId={item_id}, "
+                        f"itemIndex={index}, sequence={sequence}",
+                        flush=True,
+                    )
+                item_sent = True
+            return item_sent
+
         expected_value = result.get("written", result["testValue"])
         until = time.monotonic() + args.observe_seconds
 
@@ -758,6 +961,8 @@ def main():
                 ">3I", MAILBOX_MAGIC, MAILBOX_VERSION, expected_value
             ):
                 raise RuntimeError("Mailbox changed during the observation period")
+            if test_item_ids and args.send_test_item_delay > 0:
+                send_pending_item()
             time.sleep(0.1)
 
         result["observed_seconds"] = args.observe_seconds
@@ -778,10 +983,46 @@ def main():
         if args.output:
             args.output.write_text(json.dumps(result, indent=2) + "\n")
 
-        if args.watch:
-            watch_star_events(dme, address, acknowledge=args.ack_events)
+        if test_item_ids:
+            send_pending_item()
 
-        if args.ack_events and not args.watch:
+        if args.send_test_stars:
+            for index in range(args.send_test_stars):
+                send_test_item(
+                    dme,
+                    address,
+                    item_id=2,
+                    item_index=index,
+                )
+
+            print(f"Sent {args.send_test_stars} test Power Stars", flush=True)
+
+        if args.send_test_item:
+            sequence = send_test_item(dme, address)
+
+            print(
+                json.dumps(
+                    {"incomingQueue": read_incoming_items(dme.read_bytes, address)},
+                    indent=2,
+                )
+            )
+
+            print(
+                f"Sent test item: itemId=2, itemIndex=0, sequence={sequence}",
+                flush=True,
+            )
+
+        if test_item_ids and not item_sent:
+            watch_star_events(
+                dme,
+                address,
+                acknowledge=args.ack_events,
+                send_pending_item=send_pending_item,
+                stop_after_item=not args.watch,
+            )
+        elif args.watch:
+            watch_star_events(dme, address, acknowledge=args.ack_events)
+        elif args.ack_events:
             count = ack_star_events(dme, address, result["starQueue"])
             print(f"Acknowledge {count} star event(s)")
 
