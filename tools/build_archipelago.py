@@ -469,7 +469,7 @@ def build(region, game_dir=None, game_output=None):
     mailbox, mailbox_size = module_syms["gArchipelagoMailbox"]
     ready, ready_size = module_syms["gArchipelagoModuleReady"]
     if (
-        mailbox_size != 2196
+        mailbox_size != 2460
         or ready_size != 4
         or mailbox + mailbox_size > code
         or ready + ready_size > code + bss

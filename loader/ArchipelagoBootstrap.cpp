@@ -115,7 +115,7 @@ extern "C" void apLoadAndCreateRootHeap() {
     volatile u32* mailbox = (volatile u32*)(base + AP_MAILBOX_OFFSET);
 
     // mailbox[1] = mailbox version
-    if (mailbox[0] != 0x4150534D || mailbox[1] != 2 || *(volatile u32*)(base + AP_READY_OFFSET) != 0x41505244)
+    if (mailbox[0] != 0x4150534D || mailbox[1] != 3 || *(volatile u32*)(base + AP_READY_OFFSET) != 0x41505244)
         fail(10);
     // No heap exists yet; return only the last, temporary arena allocation.
     if ((u32)OSGetMEM1ArenaLo() != (u32)binary + readSize)

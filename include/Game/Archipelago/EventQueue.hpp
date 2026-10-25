@@ -37,7 +37,6 @@ bool EventQueue< T, Capacity >::push(const T& event) {
     return true;
 }
 
-// non utilisé, car c'est Python qui le fera
 template < typename T, unsigned int Capacity >
 bool EventQueue< T, Capacity >::pop(T& event) {
     if (Capacity <= 0)
