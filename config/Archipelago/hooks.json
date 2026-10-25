@@ -4,6 +4,34 @@
     "StageResult": {
       "owner": "requestGalaxyMove__20GameSequenceProgressFRC18GalaxyMoveArgument",
       "callee": "updateGameDataAndSequenceAfterStageResultSequence__20GameSequenceFunctionFv"
+    },
+    "GameUpdate": {
+      "owner": "frameLoop__10GameSystemFv",
+      "callee": "update__10GameSystemFv"
+    },
+    "GalaxyUnlock": {
+      "owner": "canOn__20GameEventFlagCheckerCFPCc",
+      "callee": "isOnGalaxy__20GameEventFlagCheckerCFPCc"
+    },
+    "DomeRevival": {
+      "owner": "selectNrvWait__11AstroMapObjFv",
+      "callee": "isAlreadyRevival__19AstroMapObjFunctionFPCcl"
+    },
+    "DomeOpen": {
+      "owner": "setStateDoorOpenOrClose__11AstroMapObjFv",
+      "callee": "isAlreadyOpen__19AstroMapObjFunctionFPCcl"
+    },
+    "DomeEnter": {
+      "owner": "isInVolume__20AstroChangeStageCubeCFRCQ29JGeometry8TVec3<f>",
+      "callee": "hasGrandStar__2MRFi"
+    },
+    "WarpPodMovement": {
+      "owner": "movement__7WarpPodFv",
+      "callee": "movement__9LiveActorFv"
+    },
+    "AstroMapObjControl": {
+      "owner": "control__11AstroMapObjFv",
+      "callee": "control__11MapObjActorFv"
     }
   }
 }
